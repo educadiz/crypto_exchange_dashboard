@@ -19,6 +19,12 @@
  */
 
 #include "tft_display.h"
+#include "binance_market.h"
+
+static const char WIFI_SSID[] = "spectrum_01";
+static const char WIFI_PASSWORD[] = "22602260";
+
+BinanceMarket market;
 
 // Este arquivo agora fica apenas com a lógica principal
 // e inicializa o módulo de display `tft_display`.
@@ -26,18 +32,15 @@
 void setup() {
   Serial.begin(115200);
   delay(800);
-  Serial.println("\n=== TFT ESP32-S3 FINAL (refatorado) ===");
+  Serial.println("\n=== BINANCE DASHBOARD ESP32-S3 ===");
 
-  // Inicializa o display (módulo cuida da pinagem e do objeto)
+  // Inicializa o display e a conexao de mercado.
   displayInit();
-
-  // Exemplo de uso com sensores reais:
-  // displayUseSimulation(false);
+  market.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-// Loop principal minimalista delegando ao módulo
 void loop() {
-  // Se estiver em modo real, atualize aqui antes de displayTick():
-  // displaySetMeasurements(tempC, humPct, pressHpa, rpmMotor);
+  market.loop();
+  displaySetMarketData(market.data());
   displayTick();
 }

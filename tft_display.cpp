@@ -38,6 +38,16 @@ static int usdGraphX = 0;
 static int btcGraphX = 0;
 static int usdGraphPrevY = -1;
 static int btcGraphPrevY = -1;
+static const uint16_t GRAPH_POINTS = 180;
+static float usdGraphHistory[GRAPH_POINTS];
+static float btcGraphHistory[GRAPH_POINTS];
+static uint16_t usdGraphCount = 0;
+static uint16_t btcGraphCount = 0;
+static uint16_t usdGraphHead = 0;
+static uint16_t btcGraphHead = 0;
+static uint32_t lastGraphSampleCount = 0;
+static unsigned long lastGraphSampleMs = 0;
+static bool graphsNeedRedraw = true;
 
 static uint16_t colorBg;
 static uint16_t colorPanel;
@@ -150,7 +160,7 @@ static void drawStaticShell() {
   drawFrame(122, 84, CARD_W, CARD_H, "ETHEREUM");
 
   drawFrame(6, 138, 228, 18, "");
-  drawFrame(6, 162, 228, 74, "Tendencia USD x BRL");
+  drawFrame(6, 162, 228, 74, "Tendencia ETH x BRL");
   drawFrame(6, 240, 228, 74, "Tendencia BTC x BRL");
 
   tft->setTextSize(1);
@@ -212,65 +222,94 @@ static int scaleToY(float value, float vmin, float vmax, int top, int bottom) {
   return bottom - (int)(n * (bottom - top));
 }
 
-static void plotTrendStep() {
-  if (!currentData.hasUsdtBrl || !currentData.hasBtcUsdt) {
+static void pushGraphSample(float ethBrl, float usdBrl) {
+  usdGraphHistory[usdGraphHead] = usdBrl;
+  btcGraphHistory[btcGraphHead] = ethBrl;
+
+  usdGraphHead = (uint16_t)((usdGraphHead + 1) % GRAPH_POINTS);
+  btcGraphHead = (uint16_t)((btcGraphHead + 1) % GRAPH_POINTS);
+
+  if (usdGraphCount < GRAPH_POINTS) usdGraphCount++;
+  if (btcGraphCount < GRAPH_POINTS) btcGraphCount++;
+
+  graphsNeedRedraw = true;
+}
+
+static void drawGraphArea(int left, int top, int width, int height, const float* history, uint16_t count, uint16_t head, uint16_t lineColor, uint16_t gridColor) {
+  tft->fillRect(left, top, width, height, colorPanel);
+  tft->drawRect(left, top, width, height, colorLine);
+
+  if (count == 0) {
     return;
   }
 
-  const int left = 10;
-  const int width = 220;
+  float minValue = history[(head + GRAPH_POINTS - count) % GRAPH_POINTS];
+  float maxValue = minValue;
 
-  const int usdTop = 178;
-  const int usdBottom = 227;
-  const int btcTop = 256;
-  const int btcBottom = 305;
-
-  const float usdValue = currentData.usdtBrl;
-  const float btcValueK = currentData.btcBrl / 1000.0f;
-
-  if (usdGraphX == 0) {
-    tft->fillRect(left, usdTop, width, usdBottom - usdTop + 1, colorPanel);
-    tft->fillRect(left, btcTop, width, btcBottom - btcTop + 1, colorPanel);
-    tft->drawFastHLine(left, (usdTop + usdBottom) / 2, width, rgb(46, 73, 102));
-    tft->drawFastHLine(left, (btcTop + btcBottom) / 2, width, rgb(46, 73, 102));
-    usdGraphPrevY = -1;
-    btcGraphPrevY = -1;
+  for (uint16_t i = 0; i < count; ++i) {
+    const uint16_t index = (uint16_t)((head + GRAPH_POINTS - count + i) % GRAPH_POINTS);
+    const float value = history[index];
+    if (value < minValue) minValue = value;
+    if (value > maxValue) maxValue = value;
   }
 
-  tft->drawFastVLine(left + usdGraphX, usdTop, usdBottom - usdTop + 1, colorPanel);
-  tft->drawFastVLine(left + btcGraphX, btcTop, btcBottom - btcTop + 1, colorPanel);
-
-  const int usdY = scaleToY(usdValue, 4.0f, 7.5f, usdTop, usdBottom);
-  const int btcY = scaleToY(btcValueK, 300.0f, 1000.0f, btcTop, btcBottom);
-
-  if (usdGraphPrevY >= 0) {
-    tft->drawLine(left + usdGraphX - 1, usdGraphPrevY, left + usdGraphX, usdY, colorBrl);
-  } else {
-    tft->drawPixel(left + usdGraphX, usdY, colorBrl);
+  if ((maxValue - minValue) < 0.0001f) {
+    maxValue += 1.0f;
+    minValue -= 1.0f;
   }
 
-  if (btcGraphPrevY >= 0) {
-    tft->drawLine(left + btcGraphX - 1, btcGraphPrevY, left + btcGraphX, btcY, colorBtc);
-  } else {
-    tft->drawPixel(left + btcGraphX, btcY, colorBtc);
+  const int innerLeft = left + 2;
+  const int innerTop = top + 2;
+  const int innerWidth = width - 4;
+  const int innerHeight = height - 4;
+  const int innerBottom = innerTop + innerHeight - 1;
+
+  tft->drawFastHLine(innerLeft, innerTop + innerHeight / 2, innerWidth, gridColor);
+
+  int prevX = -1;
+  int prevY = -1;
+
+  for (uint16_t i = 0; i < count; ++i) {
+    const uint16_t index = (uint16_t)((head + GRAPH_POINTS - count + i) % GRAPH_POINTS);
+    const float value = history[index];
+    const int x = (count == 1)
+      ? innerLeft + innerWidth / 2
+      : innerLeft + (int)((uint32_t)i * (uint32_t)(innerWidth - 1) / (uint32_t)(count - 1));
+    const int y = scaleToY(value, minValue, maxValue, innerTop, innerBottom);
+
+    if (prevX >= 0) {
+      tft->drawLine(prevX, prevY, x, y, lineColor);
+    } else {
+      tft->drawPixel(x, y, lineColor);
+    }
+
+    prevX = x;
+    prevY = y;
   }
-
-  usdGraphPrevY = usdY;
-  btcGraphPrevY = btcY;
-
-  usdGraphX++;
-  btcGraphX++;
-  if (usdGraphX >= width) usdGraphX = 0;
-  if (btcGraphX >= width) btcGraphX = 0;
 }
 
-static bool shouldRefreshGraphs() {
-  const unsigned long now = millis();
-  if ((now - lastGraphTickMs) < 500UL) {
-    return false;
+static void updateRealtimeGraphs() {
+  if (!currentData.hasUsdtBrl || !currentData.hasEthUsdt || !currentData.hasBtcUsdt) {
+    return;
   }
-  lastGraphTickMs = now;
-  return true;
+
+  const unsigned long now = millis();
+  const bool newTick = (currentData.messageCount != lastGraphSampleCount);
+  const bool due = ((now - lastGraphSampleMs) >= 250UL);
+
+  if (!newTick && !due && !graphsNeedRedraw) {
+    return;
+  }
+
+  lastGraphSampleCount = currentData.messageCount;
+  lastGraphSampleMs = now;
+
+  pushGraphSample(currentData.ethBrl, currentData.btcBrl);
+
+  drawGraphArea(10, 178, 220, 50, btcGraphHistory, btcGraphCount, btcGraphHead, rgb(255, 214, 64), rgb(46, 73, 102));
+  drawGraphArea(10, 256, 220, 50, usdGraphHistory, usdGraphCount, usdGraphHead, colorBrl, rgb(46, 73, 102));
+
+  graphsNeedRedraw = false;
 }
 
 static void renderIfChanged() {
@@ -326,13 +365,13 @@ static void renderIfChanged() {
   tft->setTextSize(1);
   tft->setTextColor(colorText, colorPanel);
 
-  char usdGraphText[20];
+  char ethGraphText[20];
   char btcGraphText[20];
-  snprintf(usdGraphText, sizeof(usdGraphText), "%.4f BRL", currentData.usdtBrl);
+  snprintf(ethGraphText, sizeof(ethGraphText), "%.2fK BRL", currentData.ethBrl / 1000.0f);
   snprintf(btcGraphText, sizeof(btcGraphText), "%.2fK BRL", currentData.btcBrl / 1000.0f);
 
   tft->setCursor(124, 166);
-  tft->print(usdGraphText);
+  tft->print(ethGraphText);
   tft->setCursor(124, 244);
   tft->print(btcGraphText);
 
@@ -364,6 +403,15 @@ void displayInit() {
 
   memset(&currentData, 0, sizeof(currentData));
   memset(&lastDrawnData, 0, sizeof(lastDrawnData));
+  memset(usdGraphHistory, 0, sizeof(usdGraphHistory));
+  memset(btcGraphHistory, 0, sizeof(btcGraphHistory));
+  usdGraphCount = 0;
+  btcGraphCount = 0;
+  usdGraphHead = 0;
+  btcGraphHead = 0;
+  lastGraphSampleCount = 0;
+  lastGraphSampleMs = 0;
+  graphsNeedRedraw = true;
   drawStaticShell();
   renderIfChanged();
 }
@@ -399,9 +447,7 @@ void displayTick() {
     lastRenderedMessageCount = currentData.messageCount;
   }
 
-  if (currentData.messageCount != 0 && shouldRefreshGraphs()) {
-    plotTrendStep();
-  }
+  updateRealtimeGraphs();
 }
 
 void displaySetDuration(unsigned long) {}

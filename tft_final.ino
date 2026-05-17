@@ -63,6 +63,10 @@ void animationTask(void* pv) {
 }
 
 // Este arquivo agora inicializa os subsistemas e cria as tasks FreeRTOS.
+// tft_final.ino
+// Entrypoint: inicializa subsistemas e cria as tasks FreeRTOS.
+// Não contém lógica de negócios, apenas orquestra inicialização.
+
 void setup() {
   Serial.begin(115200);
   delay(800);

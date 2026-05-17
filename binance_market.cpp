@@ -1,3 +1,7 @@
+// binance_market.cpp
+// Conecta ao Binance WebSocket, mantém um snapshot em memória e fornece
+// acesso de leitura a partir de outras threads/tasks.
+
 #include "binance_market.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
@@ -51,7 +55,13 @@ void BinanceMarket::loop() {
 
   snapshot.wifiConnected = (WiFi.status() == WL_CONNECTED);
 
-  if (!snapshot.wifiConnected) {
+  // Atualiza IP quando WiFi está conectado (preenche snapshot.wifiIp)
+  if (snapshot.wifiConnected) {
+    IPAddress ip = WiFi.localIP();
+    std::snprintf(snapshot.wifiIp, sizeof(snapshot.wifiIp), "%d.%d.%d.%d",
+                  ip[0], ip[1], ip[2], ip[3]);
+  } else {
+    snapshot.wifiIp[0] = '\0';
     snapshot.wsConnected = false;
 
     if (wsStarted) {
@@ -81,6 +91,9 @@ void BinanceMarket::connectWiFi() {
   WiFi.disconnect(false, false);
   WiFi.begin(wifiSsid, wifiPassword);
 }
+
+// connectWebSocket
+// Cria e configura a conexão WebSocket segura para o stream de mercado.
 
 // ======================= WS CONNECT ======================
 void BinanceMarket::connectWebSocket() {

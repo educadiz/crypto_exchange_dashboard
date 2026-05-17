@@ -1,10 +1,11 @@
 #include "tft_display.h"
+// tft_display.cpp
+// Renderiza a UI principal: cards de preços, gráficos e ticker.
+// Mantém buffers de desenho off-screen e atualiza apenas regiões mudadas.
 #include "ticker_manager.h"
 #include <SPI.h>
 #include <math.h>
 #include <string.h>
-
-// FreeRTOS primitives for thread-safety
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -91,6 +92,10 @@ static uint16_t colorDown;
 static uint16_t colorWarn;
 static uint16_t colorFlashUpBg;
 static uint16_t colorFlashDownBg;
+// Extras visuais - nao usados em logica, so em renderizacao
+static uint16_t colorGold;
+static uint16_t colorStatusBg;
+static uint16_t colorDotRing;
 
 static const unsigned long PRICE_FLASH_MS = 150UL;
 
@@ -115,43 +120,35 @@ void displayEnableWidgetBrl(bool enabled) { widgetBrlEnabled = enabled; }
 void displayEnableWidgetBtc(bool enabled) { widgetBtcEnabled = enabled; }
 void displayEnableWidgetEth(bool enabled) { widgetEthEnabled = enabled; }
 
-static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
-  return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
-}
+// Centraliza utilitários de cor (rgb565 / blend565)
+#include "display_utils.h"
 
 static void initPalette() {
-  colorBg     = rgb(9, 18, 30);
-  colorPanel  = rgb(19, 31, 49);
-  colorPanel2 = rgb(24, 41, 64);
-  colorLine   = rgb(59, 92, 130);
-  colorText   = rgb(231, 239, 246);
-  colorMuted  = rgb(153, 173, 197);
-  colorAccent = rgb(231, 239, 246);
-  colorUsd    = rgb(89, 214, 137);
-  colorBrl    = rgb(54, 169, 255);
-  colorBtc    = rgb(255, 116, 80);
-  colorEth    = rgb(180, 141, 255);
-  colorOk     = rgb(86, 212, 126);
-  colorDown   = rgb(255, 82, 82);
-  colorWarn   = rgb(255, 167, 63);
-  colorFlashUpBg = rgb(19, 45, 31);
-  colorFlashDownBg = rgb(45, 20, 24);
-}
-
-static uint16_t blend565(uint16_t base, uint16_t accent, uint8_t accentWeight) {
-  const uint8_t baseWeight = 255 - accentWeight;
-  const uint8_t baseR = (base >> 11) & 0x1F;
-  const uint8_t baseG = (base >> 5) & 0x3F;
-  const uint8_t baseB = base & 0x1F;
-  const uint8_t accentR = (accent >> 11) & 0x1F;
-  const uint8_t accentG = (accent >> 5) & 0x3F;
-  const uint8_t accentB = accent & 0x1F;
-
-  const uint8_t outR = (uint8_t)((baseR * baseWeight + accentR * accentWeight) / 255);
-  const uint8_t outG = (uint8_t)((baseG * baseWeight + accentG * accentWeight) / 255);
-  const uint8_t outB = (uint8_t)((baseB * baseWeight + accentB * accentWeight) / 255);
-
-  return (uint16_t)((outR << 11) | (outG << 5) | outB);
+  // Fundo e painéis: azul-marinho profundo
+  colorBg     = rgb565(9,  18,  30);   // #09121E
+  colorPanel  = rgb565(16, 27,  44);   // #101B2C — ligeiramente mais escuro p/ contraste
+  colorPanel2 = rgb565(22, 38,  58);   // #16263A — header/statusbar
+  colorLine   = rgb565(46, 78, 118);   // #2E4E76 — bordas dos cards
+  // Texto
+  colorText   = rgb565(225, 237, 248); // #E1EDF8
+  colorMuted  = rgb565(130, 158, 190); // #829EBE — labels e unidades
+  colorAccent = rgb565(225, 237, 248); // mesmo que text
+  // Cores por ativo — saturadas, distintas entre si
+  colorUsd    = rgb565(67, 236, 123); // #56D68C verde-menta (DOLAR estável)
+  colorBrl    = rgb565(48,  168, 255); // #30A8FF azul-elétrico (USD/BRL)
+  colorBtc    = rgb565(244, 114,  79); // #F4724F laranja-BTC
+  colorEth    = rgb565(172, 130, 255); // #AC82FF lilás-ETH
+  // Estados de mercado
+  colorOk     = rgb565(43, 248, 2); // #44D276 verde subida
+  colorDown   = rgb565(250, 34, 34); // #FF4848 vermelho descida
+  colorWarn   = rgb565(255, 165,  48); // #FFA530 laranja warning
+  // Flash de preço: fundo discreto mas visível
+  colorFlashUpBg   = rgb565(14,  52,  28); // #0E341C
+  colorFlashDownBg = rgb565(52,  14,  18); // #340E12
+  // Extras visuais
+  colorGold      = rgb565(255, 210,  52); // #FFD234 linha BTC/BRL nos graficos
+  colorStatusBg  = rgb565(12,  22,  36); // #0C1624 barra de status inferior
+  colorDotRing   = rgb565(44, 160,  90); // #2CA05A anel externo do dot WiFi ativo
 }
 
 static void fillText(char* out, size_t outSize, const char* text) {
@@ -183,17 +180,26 @@ static void formatCompact3(float value, char* out, size_t outSize) {
   }
 }
 
-static void drawFrame(int x, int y, int w, int h, const char* title) {
+// accentColor = 0 -> sem barra de accent; != 0 -> pinta 2px no topo interno do frame
+static void drawFrame(int x, int y, int w, int h, const char* title, uint16_t accentColor = 0) {
   tft->fillRect(x, y, w, h, colorPanel);
   tft->drawRect(x, y, w, h, colorLine);
+  if (accentColor != 0) {
+    // Barra accent de 2px no topo interno (sobreposta a borda)
+    tft->drawFastHLine(x + 1, y + 1, w - 2, accentColor);
+    tft->drawFastHLine(x + 1, y + 2, w - 2, blend565(accentColor, colorPanel, 140));
+  }
   if (title && title[0] != '\0') {
     tft->setTextSize(1);
-    tft->setTextColor(colorMuted);
-    tft->setCursor(x + 6, y + 4);
+    tft->setTextColor(colorMuted, colorPanel);
+    tft->setCursor(x + 6, y + 5);
     tft->print(title);
   }
 }
 
+// drawCenteredStatusText
+// Desenha uma pequena faixa de texto centralizada dentro de uma largura `w`.
+// Usado para textos de status no cabeçalho.
 static void drawCenteredStatusText(int x, int y, int w, const char* text) {
   const int textW = (int)strlen(text) * 6;
   int textX = x + (w - textW) / 2;
@@ -206,51 +212,72 @@ static void drawCenteredStatusText(int x, int y, int w, const char* text) {
   tft->print(text);
 }
 
-static void drawHeader() {
-  // placeholder: old signature kept for static shell; real header uses data-aware version
-  tft->fillRect(0, 0, SCREEN_W, 26, colorPanel2);
-  tft->drawFastHLine(0, 25, SCREEN_W, colorLine);
-  tft->setTextSize(1);
-  tft->setTextColor(colorAccent);
-  tft->setCursor(8, 8);
-  tft->print("Cadiz - Crypto Exchange Dashboard");
-
-  const uint16_t netColor = colorWarn;
-  tft->fillCircle(SCREEN_W - 12, 13, 5, netColor);
-  tft->drawCircle(SCREEN_W - 12, 13, 5, colorText);
-}
-
+// drawHeaderStatic
+// Desenha elementos estáticos do cabeçalho (barra superior, título e linha)
 static void drawHeaderStatic() {
   tft->fillRect(0, 0, SCREEN_W, 26, colorPanel2);
+  // Linha inferior do header
   tft->drawFastHLine(0, 25, SCREEN_W, colorLine);
+  // Linha accent fina no topo absoluto (1 px)
+  tft->drawFastHLine(0, 0, SCREEN_W, colorBrl);
   tft->setTextSize(1);
-  tft->setTextColor(colorAccent);
-  tft->setCursor(8, 8);
-  tft->print("Cadiz - Crypto Exchange Dashboard");
+  tft->setTextColor(colorAccent, colorPanel2);
+  tft->setCursor(8, 9);
+  tft->print("Cadiz  Crypto  Exchange");
 }
 
+// updateHeaderStatus
+// Atualiza o indicador de conectividade (dot) no canto superior direito.
+// Desenha anel externo, ponto central e ícones auxiliares conforme estado.
 static void updateHeaderStatus(const CryptoMarketData& data) {
-  const uint16_t netColor = data.wifiConnected ? colorOk : colorWarn;
-  tft->fillCircle(SCREEN_W - 12, 13, 5, colorPanel2);
-  tft->fillCircle(SCREEN_W - 12, 13, 5, netColor);
-  tft->drawCircle(SCREEN_W - 12, 13, 5, colorText);
+  const int cx = SCREEN_W - 13;
+  const int cy = 13;
+  // Limpa area ao redor do dot
+  tft->fillRect(cx - 9, cy - 9, 18, 18, colorPanel2);
+  if (data.wifiConnected && data.wsConnected) {
+    // Anel externo sutil (conexao plena)
+    tft->drawCircle(cx, cy, 7, colorDotRing);
+  }
+  const uint16_t dotColor = data.wifiConnected
+    ? (data.wsConnected ? colorOk : colorWarn)
+    : colorDown;
+  tft->fillCircle(cx, cy, 5, dotColor);
+  tft->drawCircle(cx, cy, 5, colorText);
+  // Ponto WS menor no centro quando ambos ativos
+  if (data.wifiConnected && data.wsConnected && data.dataReady) {
+    tft->fillCircle(cx, cy, 2, colorPanel2);
+  }
 }
 
+// drawStaticShell
+// Desenha a estrutura fixa da UI: painéis, frames e linhas de grade.
+// Executado uma vez na inicialização e quando for necessário redesenhar tudo.
 static void drawStaticShell() {
   tft->fillScreen(colorBg);
   drawHeaderStatic();
 
-  drawFrame(6, 32, CARD_W, CARD_H, "DOLAR");
-  drawFrame(122, 32, CARD_W, CARD_H, "REAL");
-  drawFrame(6, 84, CARD_W, CARD_H, "BITCOIN");
-  drawFrame(122, 84, CARD_W, CARD_H, "ETHEREUM");
+  // Cards de preço com accent bar por ativo
+  drawFrame(6,   32, CARD_W, CARD_H, "DOLAR",    colorUsd);
+  drawFrame(122, 32, CARD_W, CARD_H, "REAL",     colorBrl);
+  drawFrame(6,   84, CARD_W, CARD_H, "BITCOIN",  colorBtc);
+  drawFrame(122, 84, CARD_W, CARD_H, "ETHEREUM", colorEth);
 
+  // Frame ticker e gráficos
   drawFrame(6, 138, 228, 18, "");
   drawFrame(6, 162, 228, 74, "Tendencia ETH x BRL");
   drawFrame(6, 240, 228, 74, "Tendencia BTC x BRL");
 
-  tft->drawFastHLine(10, 199, 220, rgb(46, 73, 102));
-  tft->drawFastHLine(10, 277, 220, rgb(46, 73, 102));
+  // Linhas de grade central dos gráficos
+  tft->drawFastHLine(8, 199, 224, blend565(colorLine, colorPanel, 180));
+  tft->drawFastHLine(8, 277, 224, blend565(colorLine, colorPanel, 180));
+
+  // Status bar inferior: fundo + linha de separação
+  tft->fillRect(0, 306, SCREEN_W, 14, colorStatusBg);
+  tft->drawFastHLine(0, 306, SCREEN_W, colorLine);
+  tft->setTextSize(1);
+  tft->setTextColor(colorMuted, colorStatusBg);
+  tft->setCursor(6, 309);
+  tft->print("IP: ---.---.---.---");
 
   usdGraphX = 0;
   btcGraphX = 0;
@@ -258,6 +285,9 @@ static void drawStaticShell() {
   btcGraphPrevY = -1;
 }
 
+// drawMetricValue
+// Desenha o valor principal de um card (valor + unidade) e evita redraw
+// se o texto e a cor não mudaram, para reduzir escrita na tela.
 static void drawMetricValue(int x, int y, int w, const char* value, const char* unit, uint16_t color, uint16_t bgColor, char* prevText, uint16_t* prevColor, bool forceRedraw) {
   if (!forceRedraw && strcmp(prevText, value) == 0 && prevColor && *prevColor == color) {
     return;
@@ -268,19 +298,33 @@ static void drawMetricValue(int x, int y, int w, const char* value, const char* 
     *prevColor = color;
   }
 
-  // Limpa apenas a faixa do valor, preservando o titulo do card.
-  tft->fillRect(x + 1, y + 14, w - 2, 28, bgColor);
+  // Limpa apenas a faixa do valor, preservando titulo e accent bar do card
+  tft->fillRect(x + 1, y + 14, w - 2, 32, bgColor);
 
+  // Valor principal (size 2 = 12x16 px por char)
   tft->setTextSize(2);
   tft->setTextColor(color, bgColor);
   tft->setCursor(x + 4, y + 18);
   tft->print(value);
 
+  // Unit label alinhado à direita, muted
   tft->setTextSize(1);
-  tft->setTextColor(colorText, bgColor);
-  const int unitX = x + w - (int)strlen(unit) * 6 - 6;
-  tft->setCursor(unitX, y + 31);
+  tft->setTextColor(colorMuted, bgColor);
+  const int unitW = (int)strlen(unit) * 6;
+  tft->setCursor(x + w - unitW - 5, y + 38);
   tft->print(unit);
+
+  // Mini seta direcional no canto inferior esquerdo do card
+  // Decodifica direção pela cor: colorOk = sobe, colorDown = desce, outro = neutro
+  if (color == colorOk) {
+    // Triangulo para cima (4x4 px)
+    const int ax = x + 5, ay = y + 40;
+    tft->fillTriangle(ax + 3, ay - 4, ax, ay, ax + 6, ay, colorOk);
+  } else if (color == colorDown) {
+    // Triangulo para baixo
+    const int ax = x + 5, ay = y + 36;
+    tft->fillTriangle(ax + 3, ay + 4, ax, ay, ax + 6, ay, colorDown);
+  }
 }
 
 static void paintPriceMetric(int metricIndex,
@@ -419,33 +463,55 @@ static void drawGraphArea(BufferType& gfx, int width, int height, const float* h
     minValue -= 1.0f;
   }
 
-  const int innerLeft = 2;
-  const int innerTop = 2;
-  const int innerWidth = width - 4;
+  const int innerLeft   = 2;
+  const int innerTop    = 2;
+  const int innerWidth  = width - 4;
   const int innerHeight = height - 4;
   const int innerBottom = innerTop + innerHeight - 1;
 
+  // Linha de grade central
   gfx.drawFastHLine(innerLeft, innerTop + innerHeight / 2, innerWidth, gridColor);
 
-  int prevX = -1;
-  int prevY = -1;
+  // --- Calcular pontos da curva ---
+  // Armazenar X e Y no stack (máx 220 pontos, 2 bytes cada = 880 bytes)
+  static int16_t pxArr[220];
+  static int16_t pyArr[220];
+  const uint16_t pts = (count <= (uint16_t)innerWidth) ? count : (uint16_t)innerWidth;
 
-  for (uint16_t i = 0; i < count; ++i) {
-    const uint16_t index = (uint16_t)((head + GRAPH_POINTS - count + i) % GRAPH_POINTS);
+  for (uint16_t i = 0; i < pts; ++i) {
+    const uint16_t srcI = (count <= (uint16_t)innerWidth)
+      ? i
+      : (uint16_t)((uint32_t)i * (count - 1) / (pts - 1));
+    const uint16_t index = (uint16_t)((head + GRAPH_POINTS - count + srcI) % GRAPH_POINTS);
     const float value = history[index];
-    const int x = (count == 1)
-      ? innerLeft + innerWidth / 2
-      : innerLeft + (int)((uint32_t)i * (uint32_t)(innerWidth - 1) / (uint32_t)(count - 1));
-    const int y = scaleToY(value, minValue, maxValue, innerTop, innerBottom);
+    pxArr[i] = (int16_t)(innerLeft + (int)((uint32_t)i * (uint32_t)(innerWidth - 1) / (uint32_t)(pts - 1 > 0 ? pts - 1 : 1)));
+    pyArr[i] = (int16_t)scaleToY(value, minValue, maxValue, innerTop, innerBottom);
+  }
 
-    if (prevX >= 0) {
-      gfx.drawLine(prevX, prevY, x, y, lineColor);
-    } else {
-      gfx.drawPixel(x, y, lineColor);
+  // --- Fill de area: colunas verticais da baseline ate a curva ---
+  // Cor de fill = blend da lineColor com o fundo (alpha ~25%)
+  const uint16_t fillColor = blend565(colorPanel, lineColor, 48);
+  for (uint16_t i = 0; i < pts; ++i) {
+    const int colH = innerBottom - (int)pyArr[i];
+    if (colH > 0) {
+      gfx.drawFastVLine(pxArr[i], pyArr[i], colH, fillColor);
     }
+  }
 
-    prevX = x;
-    prevY = y;
+  // --- Linha da curva ---
+  for (uint16_t i = 1; i < pts; ++i) {
+    gfx.drawLine(pxArr[i - 1], pyArr[i - 1], pxArr[i], pyArr[i], lineColor);
+  }
+  if (pts == 1) {
+    gfx.drawPixel(pxArr[0], pyArr[0], lineColor);
+  }
+
+  // --- Dot na ponta atual (ultimo ponto) ---
+  if (pts > 0) {
+    const int lx = pxArr[pts - 1];
+    const int ly = pyArr[pts - 1];
+    gfx.fillCircle(lx, ly, 2, lineColor);
+    gfx.drawCircle(lx, ly, 3, blend565(lineColor, colorPanel, 160));
   }
 }
 
@@ -468,24 +534,24 @@ static void updateRealtimeGraphs(const CryptoMarketData& data) {
   pushGraphSample(data.ethBrl, data.btcBrl);
 
   if (btcGraphCanvas) {
-    drawGraphArea(*btcGraphCanvas, 220, 50, btcGraphHistory, btcGraphCount, btcGraphHead, rgb(255, 214, 64), rgb(46, 73, 102));
+    drawGraphArea(*btcGraphCanvas, 220, 50, btcGraphHistory, btcGraphCount, btcGraphHead, colorGold, blend565(colorLine, colorPanel, 180));
     #ifdef USE_TFT_ESPI
     tft->startWrite();
-    btcGraphCanvas->pushSprite(10, 178);
+    btcGraphCanvas->pushSprite(10, 256);
     tft->endWrite();
     #else
-    tft->drawRGBBitmap(10, 178, btcGraphCanvas->getBuffer(), 220, 50);
+    tft->drawRGBBitmap(10, 256, btcGraphCanvas->getBuffer(), 220, 50);
     #endif
   }
 
   if (usdGraphCanvas) {
-    drawGraphArea(*usdGraphCanvas, 220, 50, usdGraphHistory, usdGraphCount, usdGraphHead, colorBrl, rgb(46, 73, 102));
+    drawGraphArea(*usdGraphCanvas, 220, 50, usdGraphHistory, usdGraphCount, usdGraphHead, colorBrl, blend565(colorLine, colorPanel, 180));
     #ifdef USE_TFT_ESPI
     tft->startWrite();
-    usdGraphCanvas->pushSprite(10, 256);
+    usdGraphCanvas->pushSprite(10, 178);
     tft->endWrite();
     #else
-    tft->drawRGBBitmap(10, 256, usdGraphCanvas->getBuffer(), 220, 50);
+    tft->drawRGBBitmap(10, 178, usdGraphCanvas->getBuffer(), 220, 50);
     #endif
   }
 
@@ -526,10 +592,10 @@ static void renderIfChanged(const CryptoMarketData& data) {
     ? colorBrl
     : (data.usdtBrl > lastDrawnData.usdtBrl ? colorOk : colorDown);
   const uint16_t btcColor = (!lastDrawnData.hasBtcUsdt || data.btcUsdt == lastDrawnData.btcUsdt)
-    ? colorBrl
+    ? colorBtc
     : (data.btcUsdt > lastDrawnData.btcUsdt ? colorOk : colorDown);
   const uint16_t ethColor = (!lastDrawnData.hasEthUsdt || data.ethUsdt == lastDrawnData.ethUsdt)
-    ? colorBrl
+    ? colorEth
     : (data.ethUsdt > lastDrawnData.ethUsdt ? colorOk : colorDown);
 
   if (widgetUsdEnabled) paintPriceMetric(-1, 6, 32, CARD_W, usdText, "USD", usdColor, colorPanel, prevUsdText, &prevUsdColor, false);
@@ -546,20 +612,54 @@ static void renderIfChanged(const CryptoMarketData& data) {
     paintPriceMetric(PRICE_METRIC_ETH, 122, 84, CARD_W, ethText, "USD", ethColor, priceFlashUntilMs[PRICE_METRIC_ETH] ? priceFlashBg[PRICE_METRIC_ETH] : colorPanel, prevEthText, &prevEthColor, ethChanged);
   }
 
-  tft->fillRect(120, 164, 114, 10, colorPanel);
-  tft->fillRect(120, 242, 114, 10, colorPanel);
-  tft->setTextSize(1);
-  tft->setTextColor(colorText, colorPanel);
+  // --- Labels do valor atual nos gráficos (linha do título) ---
+  // ETH BRL (frame y=162, título em y=167, label em y=162)
+  {
+    char ethGraphText[20];
+    snprintf(ethGraphText, sizeof(ethGraphText), "%.2fK BRL", data.ethBrl / 1000.0f);
+    const int labelW = (int)strlen(ethGraphText) * 6;
+    tft->fillRect(135, 163, 99, 10, colorPanel);
+    tft->setTextSize(1);
+    tft->setTextColor(colorEth, colorPanel);
+    tft->setCursor(230 - labelW, 165);
+    tft->print(ethGraphText);
+  }
+  // BTC BRL (frame y=240, título em y=245, label em y=242)
+  {
+    char btcGraphText[20];
+    snprintf(btcGraphText, sizeof(btcGraphText), "%.2fK BRL", data.btcBrl / 1000.0f);
+    const int labelW = (int)strlen(btcGraphText) * 6;
+    tft->fillRect(135, 241, 99, 10, colorPanel);
+    tft->setTextSize(1);
+    tft->setTextColor(colorGold, colorPanel);
+    tft->setCursor(230 - labelW, 243);
+    tft->print(btcGraphText);
+  }
 
-  char ethGraphText[20];
-  char btcGraphText[20];
-  snprintf(ethGraphText, sizeof(ethGraphText), "%.2fK BRL", data.ethBrl / 1000.0f);
-  snprintf(btcGraphText, sizeof(btcGraphText), "%.2fK BRL", data.btcBrl / 1000.0f);
-
-  tft->setCursor(124, 166);
-  tft->print(ethGraphText);
-  tft->setCursor(124, 244);
-  tft->print(btcGraphText);
+  // --- Status bar inferior: IP e contador de mensagens ---
+  {
+    tft->fillRect(0, 306, SCREEN_W, 14, colorStatusBg);
+    tft->drawFastHLine(0, 306, SCREEN_W, colorLine);
+    tft->setTextSize(1);
+    // IP à esquerda
+    char ipStr[28];
+    if (data.wifiConnected && data.wifiIp[0] != '\0') {
+      snprintf(ipStr, sizeof(ipStr), "IP: %s", data.wifiIp);
+    } else {
+      snprintf(ipStr, sizeof(ipStr), "IP: ---");
+    }
+    tft->setTextColor(colorMuted, colorStatusBg);
+    tft->setCursor(6, 309);
+    tft->print(ipStr);
+    // Contador à direita
+    char msgStr[16];
+    snprintf(msgStr, sizeof(msgStr), "#%lu", (unsigned long)data.messageCount);
+    const int msgW = (int)strlen(msgStr) * 6;
+    tft->fillRect(SCREEN_W - msgW - 8, 307, msgW + 6, 12, colorStatusBg);
+    tft->setTextColor(data.dataReady ? colorOk : colorWarn, colorStatusBg);
+    tft->setCursor(SCREEN_W - msgW - 6, 309);
+    tft->print(msgStr);
+  }
 
   lastDrawnData = data;
   dashboardReady = true;

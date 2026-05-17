@@ -4,6 +4,12 @@
 #include <Arduino.h>
 #include "market_data.h"
 
+// tft_display.h
+// Interface do subsistema de apresentação (dashboard).
+// Contém funções públicas para inicializar e atualizar a tela com
+// snapshots de `CryptoMarketData`.
+
+
 void displayInit();
 void displayTick();
 

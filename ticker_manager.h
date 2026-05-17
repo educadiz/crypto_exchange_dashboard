@@ -1,6 +1,10 @@
 #ifndef TICKER_MANAGER_H
 #define TICKER_MANAGER_H
 
+// ticker_manager.h
+// Interface do ticker financeiro: constrói itens a partir de `CryptoMarketData`
+// e expõe funções para inicialização e renderização.
+
 #include <Arduino.h>
 #include "market_data.h"
 

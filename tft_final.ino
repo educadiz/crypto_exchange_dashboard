@@ -30,9 +30,14 @@ void setup() {
 
   // Inicializa o display (módulo cuida da pinagem e do objeto)
   displayInit();
+
+  // Exemplo de uso com sensores reais:
+  // displayUseSimulation(false);
 }
 
 // Loop principal minimalista delegando ao módulo
 void loop() {
+  // Se estiver em modo real, atualize aqui antes de displayTick():
+  // displaySetMeasurements(tempC, humPct, pressHpa, rpmMotor);
   displayTick();
 }

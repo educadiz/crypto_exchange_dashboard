@@ -11,10 +11,16 @@
 // Inicializa o display (espera que `Serial.begin()` já tenha sido chamado)
 void displayInit();
 
-// Deve ser chamado periodicamente em `loop()` para trocar cenas automaticamente
+// Deve ser chamado periodicamente em `loop()` para atualizar o dashboard
 void displayTick();
 
-// Ajusta duração entre cenas (ms)
+// Mantido por compatibilidade com versões anteriores (sem efeito no dashboard)
 void displaySetDuration(unsigned long ms);
+
+// Habilita/desabilita modo simulado (true por padrão para demo)
+void displayUseSimulation(bool enabled);
+
+// Atualiza medições reais; útil quando modo simulado estiver desabilitado
+void displaySetMeasurements(float temperatureC, float humidityPct, float pressureHpa, float motorRpm);
 
 #endif // TFT_DISPLAY_H

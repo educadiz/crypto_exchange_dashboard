@@ -1,14 +1,14 @@
 /*
- * Implementação do módulo de display TFT.
- * Contém a inicialização do Adafruit_ST7789 e todas as cenas.
+ * Dashboard PLC para TFT ST7789 (240x320)
+ * Exemplo reutilizavel com API para dados simulados ou reais.
  */
 
 #include "tft_display.h"
 #include <SPI.h>
+#include <math.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 
-// PINAGEM (mesma do sketch original)
 #define PIN_SCK   3
 #define PIN_MOSI 45
 #define PIN_CS   14
@@ -18,38 +18,92 @@
 #define LARGURA  240
 #define ALTURA   320
 
-// Ponteiro para objeto Adafruit (interna ao módulo)
+// Profundidade de historico por variavel para os graficos
+#define TREND_SIZE 56
+
 static Adafruit_ST7789* tft = nullptr;
+static bool sim_enabled = true;
 
-// Estado do slideshow
-static int cena_atual = 0;
-static const int TOTAL_CENAS = 6;
-static unsigned long ultimo_tempo = 0;
-static unsigned long DURACAO = 3000UL;
+static float tempC = 32.0f;
+static float humPct = 55.0f;
+static float pressHpa = 1013.0f;
+static float rpmMotor = 1450.0f;
 
-// Helper para converter RGB -> RGB565
+static float tempTrend[TREND_SIZE];
+static float humTrend[TREND_SIZE];
+static float pressTrend[TREND_SIZE];
+static float rpmTrend[TREND_SIZE];
+
+// Estado de desenho incremental dos graficos (evita redraw completo)
+static int trendX = 0;
+static int g1PrevYA = -1;
+static int g1PrevYB = -1;
+static int g2PrevYA = -1;
+static int g2PrevYB = -1;
+
+// Cache de valores renderizados (dirty flags por conteudo)
+static char prevTempText[16] = "";
+static char prevHumText[16] = "";
+static char prevPressText[16] = "";
+static char prevRpmText[16] = "";
+static bool prevWarn = false;
+static bool prevWarnValid = false;
+
+static unsigned long lastSampleMs = 0;
+static unsigned long lastRenderMs = 0;
+static unsigned long legacyDurationMs = 3000UL;
+
 static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return ((uint16_t)(r & 0xF8) << 8)
        | ((uint16_t)(g & 0xFC) << 3)
        | (b >> 3);
 }
 
-// Prototipos das cenas (internos)
-static void tela_boas_vindas();
-static void cena_retangulos();
-static void cena_circulos();
-static void cena_arco_iris();
-static void cena_texto_colorido();
-static void cena_triangulos();
-static void cena_gradiente();
+// Paleta estilo HMI/PLC (contraste alto e leitura rapida)
+static const uint16_t C_BG       = rgb(10, 20, 34);
+static const uint16_t C_PANEL    = rgb(20, 33, 52);
+static const uint16_t C_PANEL_2  = rgb(26, 44, 68);
+static const uint16_t C_LINE     = rgb(56, 92, 130);
+static const uint16_t C_TEXT     = rgb(224, 235, 246);
+static const uint16_t C_MUTED    = rgb(145, 169, 196);
+static const uint16_t C_ACCENT   = rgb(52, 173, 255);
+static const uint16_t C_TEMP     = rgb(255, 116, 80);
+static const uint16_t C_HUM      = rgb(56, 220, 186);
+static const uint16_t C_PRESS    = rgb(250, 208, 90);
+static const uint16_t C_RPM      = rgb(186, 140, 255);
+static const uint16_t C_OK       = rgb(88, 213, 126);
+static const uint16_t C_WARN     = rgb(255, 172, 63);
 
-// Public API ---------------------------------------------------------------
+static void drawHeader();
+static void drawPanels();
+static bool drawMetrics(bool forceValues, bool forceTrends);
+static void drawTrendShell();
+static void plotTrendStep();
+static bool pushTrendIfChanged();
+static void seedTrend();
+static void updateSimulatedValues();
+static float clampf(float v, float vmin, float vmax);
+static int scaleToY(float v, float vmin, float vmax, int top, int bottom);
+
 void displaySetDuration(unsigned long ms) {
-  DURACAO = ms;
+  // Mantido para compatibilidade; nao altera o comportamento do dashboard.
+  legacyDurationMs = ms;
+  (void)legacyDurationMs;
+}
+
+void displayUseSimulation(bool enabled) {
+  sim_enabled = enabled;
+}
+
+void displaySetMeasurements(float temperatureC, float humidityPct, float pressureHpa, float motorRpm) {
+  // Permite alimentar o dashboard com dados reais de sensores.
+  tempC = temperatureC;
+  humPct = humidityPct;
+  pressHpa = pressureHpa;
+  rpmMotor = motorRpm;
 }
 
 void displayInit() {
-  // Configura pinos em estado seguro
   pinMode(PIN_RST,  OUTPUT);
   pinMode(PIN_DC,   OUTPUT);
   pinMode(PIN_CS,   OUTPUT);
@@ -58,202 +112,286 @@ void displayInit() {
   digitalWrite(PIN_RST, HIGH);
   delay(20);
 
-  // Reset manual
   digitalWrite(PIN_RST, LOW);  delay(100);
   digitalWrite(PIN_RST, HIGH); delay(200);
 
-  // Cria objeto (alocação dinâmica para compatibilidade com ESP32)
   tft = new Adafruit_ST7789(PIN_CS, PIN_DC, PIN_MOSI, PIN_SCK, PIN_RST);
-
-  // Inicializa controlador com resolução correta
   tft->init(LARGURA, ALTURA, SPI_MODE3);
-
-  // Define rotação e corrige MADCTL para evitar espelhamento
   tft->setRotation(2);
-  // MADCTL: 0x40 é valor comum para corrigir espelhamento horizontal
   tft->sendCommand(0x36, (uint8_t[]){0x40}, 1);
-
   tft->invertDisplay(false);
-  tft->fillScreen(ST77XX_BLACK);
 
-  Serial.println("TFT init OK (módulo)");
+  seedTrend();
 
-  // Exibe tela inicial e inicializa temporizador interno
-  tela_boas_vindas();
-  delay(3000);
-  ultimo_tempo = millis();
+  tft->fillScreen(C_BG);
+  drawHeader();
+  drawPanels();
+  drawTrendShell();
+  drawMetrics(true, true);
+
+  lastSampleMs = millis();
+  lastRenderMs = millis();
+  Serial.println("CodeWave Dashboard pronto");
 }
 
 void displayTick() {
   if (!tft) return;
-  if (millis() - ultimo_tempo >= DURACAO) {
-    ultimo_tempo = millis();
-    cena_atual = (cena_atual + 1) % TOTAL_CENAS;
-    switch (cena_atual) {
-      case 0: cena_retangulos();     break;
-      case 1: cena_circulos();       break;
-      case 2: cena_arco_iris();      break;
-      case 3: cena_texto_colorido(); break;
-      case 4: cena_triangulos();     break;
-      case 5: cena_gradiente();      break;
-    }
+
+  if (sim_enabled) {
+    updateSimulatedValues();
+  }
+
+  const unsigned long now = millis();
+  bool trendDirty = false;
+
+  // Amostragem desacoplada do frame para manter historico estavel.
+  if (now - lastSampleMs >= 900) {
+    lastSampleMs = now;
+    trendDirty = pushTrendIfChanged();
+  }
+
+  // Atualiza em baixa taxa e somente o que mudou.
+  if (now - lastRenderMs >= 220) {
+    lastRenderMs = now;
+    drawMetrics(false, trendDirty);
   }
 }
 
-// Implementação das cenas (copiado do sketch original, com comentários)
-static void tela_boas_vindas() {
-  tft->fillScreen(rgb(0, 0, 30));
-  tft->drawRect(2, 2, LARGURA-4, ALTURA-4, ST77XX_CYAN);
-  tft->drawRect(5, 5, LARGURA-10, ALTURA-10, ST77XX_BLUE);
-
+static void drawHeader() {
+  tft->fillRect(0, 0, LARGURA, 26, C_PANEL_2);
+  tft->drawFastHLine(0, 25, LARGURA, C_LINE);
   tft->setTextWrap(false);
-  tft->setTextColor(ST77XX_YELLOW);
-  tft->setTextSize(2);
-  tft->setCursor(14, 65);
-  tft->print("ESP32-S3 + TFT");
-
-  tft->setTextColor(ST77XX_WHITE);
   tft->setTextSize(1);
-  tft->setCursor(28, 98);
-  tft->print("Display 2.8\"  240x320");
+  tft->setTextColor(C_ACCENT);
+  tft->setCursor(8, 8);
+  tft->print("CodeWave Dashboard");
 
-  tft->drawFastHLine(20, 118, LARGURA-40, ST77XX_CYAN);
+  tft->setTextColor(C_MUTED);
+  tft->setCursor(175, 8);
+  tft->print("PLC/HMI");
+}
 
-  tft->setTextColor(ST77XX_GREEN);
-  tft->setTextSize(2);
-  tft->setCursor(22, 138);
-  tft->print("TESTE GRAFICO");
+static void drawCardShell(int x, int y, int w, int h) {
+  tft->fillRect(x, y, w, h, C_PANEL);
+  tft->drawRect(x, y, w, h, C_LINE);
+}
 
-  tft->setTextColor(rgb(150,150,150));
+static void drawPanels() {
+  // Linha de KPIs
+  drawCardShell(6, 32, 112, 48);
+  drawCardShell(122, 32, 112, 48);
+  drawCardShell(6, 84, 112, 48);
+  drawCardShell(122, 84, 112, 48);
+
+  // Barra de status de processo
+  drawCardShell(6, 138, 228, 18);
+
+  // Area de tendencia 1 e 2
+  drawCardShell(6, 162, 228, 74);
+  drawCardShell(6, 240, 228, 74);
+
+  // Labels fixos (evita redesenho de texto estatico a cada frame)
   tft->setTextSize(1);
-  tft->setCursor(30, 175);
-  tft->print("Iniciando em 3s...");
+  tft->setTextColor(C_MUTED);
+  tft->setCursor(11, 36);   tft->print("TEMPERATURA");
+  tft->setCursor(127, 36);  tft->print("UMIDADE");
+  tft->setCursor(11, 88);   tft->print("PRESSAO");
+  tft->setCursor(127, 88);  tft->print("MOTOR");
 
-  // Barra de progresso
-  tft->drawRect(20, 200, 200, 16, rgb(80,80,80));
-  for (int i = 0; i <= 196; i += 4) {
-    tft->fillRect(22, 202, i, 12, rgb(i, 100, 255-i));
-    delay(12);
+  // Elementos fixos dos cards dinamicos (unidades e status)
+  tft->setTextColor(C_MUTED);
+  tft->setCursor(12, 143);  tft->print("STATUS:");
+}
+
+static bool drawMetricValueIfChanged(int x, int y, int w, int h,
+                                     float value, const char* unit, uint16_t color,
+                                     char* prevText, bool force) {
+  char line[16];
+  snprintf(line, sizeof(line), "%.1f", value);
+
+  if (!force && strcmp(prevText, line) == 0) {
+    return false;
   }
 
-  tft->setTextColor(ST77XX_MAGENTA);
+  strncpy(prevText, line, 15);
+  prevText[15] = '\0';
+
+  // Desenha texto com fundo para sobrescrever sem limpar card inteiro.
+  tft->setTextColor(color, C_PANEL);
+  tft->setTextSize(2); // mexi aqui
+  tft->setCursor(x + 2, y + 4);
+  tft->print(line);
+
+  // Unidade alinhada no fim do card, com tamanho menor para caber em qualquer valor.
+  tft->setTextColor(C_TEXT, C_PANEL);
   tft->setTextSize(1);
-  tft->setCursor(12, 248); tft->print("Lib: Adafruit ST7789");
-  tft->setCursor(12, 264); tft->print("MOSI=45 SCK=3 CS=14");
-  tft->setCursor(12, 280); tft->print("DC=47  RST=21");
-
-  Serial.println("Boas-vindas OK (módulo)");
+  int unitX = x + w - (int)strlen(unit) * 6 - 4;
+  if (unitX < x + 34) unitX = x + 34;
+  tft->setCursor(unitX, y + 4);
+  tft->print(unit);
+  return true;
 }
 
-static void cena_retangulos() {
-  tft->fillScreen(ST77XX_BLACK);
-  uint16_t cores[] = {
-    ST77XX_RED,   rgb(255,165,0), ST77XX_YELLOW,
-    ST77XX_GREEN, ST77XX_CYAN,   ST77XX_BLUE,
-    rgb(128,0,128), ST77XX_MAGENTA, rgb(255,105,180), ST77XX_WHITE
-  };
-  for (int i = 0; i < 10; i++) {
-    int m = i * 11;
-    tft->drawRect(m, m, LARGURA-(m*2), ALTURA-(m*2), cores[i]);
-  }
-  tft->setTextColor(ST77XX_WHITE);
-  tft->setTextSize(1);
-  tft->setCursor(85, 156);
-  tft->print("RETANGULOS");
-  Serial.println("Cena retangulos OK (módulo)");
-}
+static bool drawStatusBarIfChanged(bool force) {
+  // Regra simples de exemplo para "status de planta"
+  bool anyWarn = (tempC > 40.0f) || (humPct < 35.0f) || (rpmMotor > 1900.0f);
 
-static void cena_circulos() {
-  tft->fillScreen(ST77XX_BLACK);
-  tft->fillCircle( 60,  80, 55, ST77XX_RED);
-  tft->fillCircle(180,  80, 55, ST77XX_BLUE);
-  tft->fillCircle( 60, 240, 55, ST77XX_GREEN);
-  tft->fillCircle(180, 240, 55, ST77XX_YELLOW);
-  tft->fillCircle(120, 160, 50, ST77XX_MAGENTA);
-  tft->drawCircle( 60,  80, 55, ST77XX_WHITE);
-  tft->drawCircle(180,  80, 55, ST77XX_WHITE);
-  tft->drawCircle( 60, 240, 55, ST77XX_WHITE);
-  tft->drawCircle(180, 240, 55, ST77XX_WHITE);
-  tft->drawCircle(120, 160, 50, ST77XX_WHITE);
-  tft->fillCircle(120, 160,  8, ST77XX_WHITE);
-  Serial.println("Cena circulos OK (módulo)");
-}
-
-static void cena_arco_iris() {
-  int alt = ALTURA / 7;
-  uint16_t cores[] = {
-    ST77XX_RED, rgb(255,165,0), ST77XX_YELLOW, ST77XX_GREEN,
-    rgb(0,100,255), ST77XX_BLUE, rgb(128,0,128)
-  };
-  for (int i = 0; i < 7; i++)
-    tft->fillRect(0, i*alt, LARGURA, alt, cores[i]);
-  tft->setTextColor(ST77XX_BLACK);
-  tft->setTextSize(2);
-  tft->setCursor(41, 157); tft->print("ARC-IRIS!");
-  tft->setTextColor(ST77XX_WHITE);
-  tft->setCursor(40, 156); tft->print("ARC-IRIS!");
-  Serial.println("Cena arcoiris OK (módulo)");
-}
-
-static void cena_texto_colorido() {
-  uint16_t bg = rgb(15,15,25);
-  tft->fillScreen(bg);
-
-  tft->setTextColor(ST77XX_YELLOW); tft->setTextSize(3);
-  tft->setCursor(10, 10);  tft->print("ESP32-S3");
-
-  tft->setTextColor(ST77XX_CYAN);   tft->setTextSize(2);
-  tft->setCursor(10, 55);  tft->print("Display TFT");
-  tft->setTextColor(ST77XX_GREEN);
-  tft->setCursor(10, 82);  tft->print("240 x 320 px");
-
-  tft->drawFastHLine(0, 110, LARGURA, rgb(60,60,60));
-
-  uint16_t c[] = { ST77XX_RED, rgb(255,165,0), ST77XX_YELLOW,
-                   ST77XX_GREEN, ST77XX_CYAN, ST77XX_BLUE, ST77XX_MAGENTA };
-  const char l[] = "ABCDEFG";
-  for (int i = 0; i < 7; i++) {
-    tft->setTextColor(c[i]);
-    tft->setTextSize(i%2==0 ? 2 : 3);
-    tft->setCursor(10+i*32, 125+(i%3)*30);
-    tft->print(l[i]);
+  if (!force && prevWarnValid && prevWarn == anyWarn) {
+    return false;
   }
 
-  tft->drawFastHLine(0, 235, LARGURA, rgb(60,60,60));
-  tft->setTextColor(rgb(255,130,180)); tft->setTextSize(1);
-  tft->setCursor(10, 248); tft->print("SCK:3  MOSI:45");
-  tft->setCursor(10, 262); tft->print("CS:14  DC:47  RST:21");
-  tft->setCursor(10, 276); tft->print("Adafruit ST7789");
-  Serial.println("Cena texto OK (módulo)");
-}
+  prevWarn = anyWarn;
+  prevWarnValid = true;
 
-static void cena_triangulos() {
-  tft->fillScreen(ST77XX_BLACK);
-  tft->fillTriangle(120, 10,  10,150, 230,150, ST77XX_RED);
-  tft->fillTriangle(120,310,  10,170, 230,170, ST77XX_BLUE);
-  tft->fillTriangle( 10, 10,  10,310, 115,160, ST77XX_GREEN);
-  tft->fillTriangle(230, 10, 230,310, 125,160, ST77XX_YELLOW);
-  tft->drawTriangle(120, 10,  10,150, 230,150, ST77XX_WHITE);
-  tft->drawTriangle(120,310,  10,170, 230,170, ST77XX_WHITE);
-  tft->fillCircle(120,160,12, ST77XX_MAGENTA);
-  tft->drawCircle(120,160,12, ST77XX_WHITE);
-  Serial.println("Cena triangulos OK (módulo)");
-}
-
-static void cena_gradiente() {
-  for (int y = 0; y < ALTURA; y++) {
-    uint8_t r = map(y, 0, ALTURA, 255, 0);
-    uint8_t g = (y < ALTURA/2)
-                  ? map(y, 0, ALTURA/2, 0, 255)
-                  : map(y, ALTURA/2, ALTURA, 255, 0);
-    uint8_t b = map(y, 0, ALTURA, 0, 255);
-    tft->drawFastHLine(0, y, LARGURA, rgb(r,g,b));
-  }
-  tft->setTextColor(ST77XX_BLACK); tft->setTextSize(2);
-  tft->setCursor(21,157); tft->print("GRADIENTE RGB");
-  tft->setTextColor(ST77XX_WHITE);
-  tft->setCursor(20,156); tft->print("GRADIENTE RGB");
+  uint16_t c = anyWarn ? C_WARN : C_OK;
   tft->setTextSize(1);
-  tft->setCursor(28,182); tft->print("ESP32-S3 | Adafruit");
-  Serial.println("Cena gradiente OK (módulo)");
+  tft->setTextColor(c, C_PANEL);
+  tft->setCursor(60, 143);
+  tft->print(anyWarn ? "ATENCAO         " : "OPERACAO NORMAL ");
+  return true;
+}
+
+static bool drawMetrics(bool forceValues, bool forceTrends) {
+  bool updated = false;
+
+  updated |= drawMetricValueIfChanged(9, 50, 106, 26, tempC, "oC", C_TEMP, prevTempText, forceValues);
+  updated |= drawMetricValueIfChanged(125, 50, 106, 26, humPct, "%", C_HUM, prevHumText, forceValues);
+  updated |= drawMetricValueIfChanged(9, 102, 106, 26, pressHpa, "hPa", C_PRESS, prevPressText, forceValues);
+  updated |= drawMetricValueIfChanged(125, 102, 106, 26, rpmMotor, "RPM", C_RPM, prevRpmText, forceValues);
+  updated |= drawStatusBarIfChanged(forceValues);
+
+  if (forceTrends) {
+    plotTrendStep();
+    updated = true;
+  }
+
+  return updated;
+}
+
+static void drawTrendShell() {
+  // Quadro superior
+  tft->fillRect(9, 163, 222, 68, C_PANEL);
+  tft->setTextSize(1);
+  tft->setTextColor(C_MUTED);
+  tft->setCursor(12, 166); tft->print("Tendencia: Temp x Umidade");
+  tft->setTextColor(C_TEMP);
+  tft->setCursor(214, 166); tft->print("T");
+  tft->setTextColor(C_HUM);
+  tft->setCursor(222, 166); tft->print("U");
+
+  // Quadro inferior
+  tft->fillRect(9, 241, 222, 68, C_PANEL);
+  tft->setTextColor(C_MUTED);
+  tft->setCursor(12, 244); tft->print("Tendencia: Pressao x Rotacao");
+  tft->setTextColor(C_PRESS);
+  tft->setCursor(214, 244); tft->print("P");
+  tft->setTextColor(C_RPM);
+  tft->setCursor(222, 244); tft->print("R");
+
+  // Grid base (uma vez)
+  tft->drawFastHLine(10, 199, 220, rgb(44, 75, 110));
+  tft->drawFastHLine(10, 277, 220, rgb(44, 75, 110));
+
+  trendX = 0;
+  g1PrevYA = g1PrevYB = g2PrevYA = g2PrevYB = -1;
+}
+
+static void plotTrendStep() {
+  // Area util dos graficos
+  const int g1Top = 178, g1Bottom = 227;
+  const int g2Top = 256, g2Bottom = 305;
+  const int left = 10, width = 220;
+
+  int x = left + trendX;
+
+  // Quando fecha uma volta, limpa apenas area de plot e reinicia continuidade.
+  if (trendX == 0) {
+    tft->fillRect(left, g1Top, width, g1Bottom - g1Top + 1, C_PANEL);
+    tft->fillRect(left, g2Top, width, g2Bottom - g2Top + 1, C_PANEL);
+    tft->drawFastHLine(left, (g1Top + g1Bottom) / 2, width, rgb(44, 75, 110));
+    tft->drawFastHLine(left, (g2Top + g2Bottom) / 2, width, rgb(44, 75, 110));
+    g1PrevYA = g1PrevYB = g2PrevYA = g2PrevYB = -1;
+  }
+
+  // Apaga apenas a coluna atual para desenhar novo ponto.
+  tft->drawFastVLine(x, g1Top, g1Bottom - g1Top + 1, C_PANEL);
+  tft->drawFastVLine(x, g2Top, g2Bottom - g2Top + 1, C_PANEL);
+
+  int yTemp  = scaleToY(tempC, 20.0f, 55.0f, g1Top, g1Bottom);
+  int yHum   = scaleToY(humPct, 20.0f, 90.0f, g1Top, g1Bottom);
+  int yPress = scaleToY(pressHpa, 980.0f, 1040.0f, g2Top, g2Bottom);
+  int yRpm   = scaleToY(rpmMotor, 1000.0f, 2200.0f, g2Top, g2Bottom);
+
+  if (g1PrevYA >= 0) tft->drawLine(x - 1, g1PrevYA, x, yTemp, C_TEMP);
+  else tft->drawPixel(x, yTemp, C_TEMP);
+  if (g1PrevYB >= 0) tft->drawLine(x - 1, g1PrevYB, x, yHum, C_HUM);
+  else tft->drawPixel(x, yHum, C_HUM);
+
+  if (g2PrevYA >= 0) tft->drawLine(x - 1, g2PrevYA, x, yPress, C_PRESS);
+  else tft->drawPixel(x, yPress, C_PRESS);
+  if (g2PrevYB >= 0) tft->drawLine(x - 1, g2PrevYB, x, yRpm, C_RPM);
+  else tft->drawPixel(x, yRpm, C_RPM);
+
+  g1PrevYA = yTemp;
+  g1PrevYB = yHum;
+  g2PrevYA = yPress;
+  g2PrevYB = yRpm;
+
+  trendX++;
+  if (trendX >= width) {
+    trendX = 0;
+  }
+}
+
+static void seedTrend() {
+  for (int i = 0; i < TREND_SIZE; i++) {
+    tempTrend[i] = tempC;
+    humTrend[i] = humPct;
+    pressTrend[i] = pressHpa;
+    rpmTrend[i] = rpmMotor;
+  }
+}
+
+static bool pushTrendIfChanged() {
+  const bool changed = (fabsf(tempC - tempTrend[TREND_SIZE - 1]) > 0.04f)
+                    || (fabsf(humPct - humTrend[TREND_SIZE - 1]) > 0.04f)
+                    || (fabsf(pressHpa - pressTrend[TREND_SIZE - 1]) > 0.03f)
+                    || (fabsf(rpmMotor - rpmTrend[TREND_SIZE - 1]) > 0.40f);
+
+  if (!changed) {
+    return false;
+  }
+
+  for (int i = 0; i < TREND_SIZE - 1; i++) {
+    tempTrend[i] = tempTrend[i + 1];
+    humTrend[i] = humTrend[i + 1];
+    pressTrend[i] = pressTrend[i + 1];
+    rpmTrend[i] = rpmTrend[i + 1];
+  }
+  tempTrend[TREND_SIZE - 1] = tempC;
+  humTrend[TREND_SIZE - 1] = humPct;
+  pressTrend[TREND_SIZE - 1] = pressHpa;
+  rpmTrend[TREND_SIZE - 1] = rpmMotor;
+  return true;
+}
+
+static void updateSimulatedValues() {
+  // Simulacao periodica realista para demonstrar o dashboard sem sensores.
+  const float t = millis() * 0.001f;
+  tempC = 33.0f + 3.0f * sinf(t * 0.82f) + 0.7f * sinf(t * 2.10f);
+  humPct = 57.0f + 9.0f * sinf(t * 0.33f + 0.9f);
+  pressHpa = 1012.0f + 4.2f * sinf(t * 0.19f) + 1.2f * sinf(t * 0.77f + 0.4f);
+  rpmMotor = 1480.0f + 210.0f * sinf(t * 1.18f) + 80.0f * sinf(t * 2.60f);
+}
+
+static float clampf(float v, float vmin, float vmax) {
+  if (v < vmin) return vmin;
+  if (v > vmax) return vmax;
+  return v;
+}
+
+static int scaleToY(float v, float vmin, float vmax, int top, int bottom) {
+  float n = (v - vmin) / (vmax - vmin);
+  n = clampf(n, 0.0f, 1.0f);
+  return bottom - (int)(n * (bottom - top));
 }

@@ -1,9 +1,14 @@
 #include "tft_display.h"
+#include "ticker_manager.h"
 #include <SPI.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
 #include <math.h>
 #include <string.h>
+
+// FreeRTOS primitives for thread-safety
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
+#include <esp_task_wdt.h>
 
 #define PIN_SCK   3
 #define PIN_MOSI 45
@@ -17,15 +22,36 @@
 #define CARD_W 112
 #define CARD_H 48
 
+#ifdef USE_TFT_ESPI
+static TFT_eSPI* tft = nullptr;
+#else
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
 static Adafruit_ST7789* tft = nullptr;
+#endif
 static CryptoMarketData currentData;
 static CryptoMarketData lastDrawnData;
 static bool dashboardReady = false;
+
+#ifdef USE_TFT_ESPI
+static TFT_eSprite* btcGraphCanvas = nullptr;
+static TFT_eSprite* usdGraphCanvas = nullptr;
+#else
+static GFXcanvas16* btcGraphCanvas = nullptr;
+static GFXcanvas16* usdGraphCanvas = nullptr;
+#endif
+
+// Mutex protecting access to currentData
+static SemaphoreHandle_t dataMutex = NULL;
 
 static char prevUsdText[20] = "";
 static char prevBrlText[20] = "";
 static char prevBtcText[20] = "";
 static char prevEthText[20] = "";
+static uint16_t prevUsdColor = 0;
+static uint16_t prevBrlColor = 0;
+static uint16_t prevBtcColor = 0;
+static uint16_t prevEthColor = 0;
 static char prevWifiSsid[33] = "";
 static char prevWifiIp[16] = "";
 static bool prevWifi = false;
@@ -63,6 +89,31 @@ static uint16_t colorEth;
 static uint16_t colorOk;
 static uint16_t colorDown;
 static uint16_t colorWarn;
+static uint16_t colorFlashUpBg;
+static uint16_t colorFlashDownBg;
+
+static const unsigned long PRICE_FLASH_MS = 150UL;
+
+enum PriceMetricIndex {
+  PRICE_METRIC_BRL = 0,
+  PRICE_METRIC_BTC = 1,
+  PRICE_METRIC_ETH = 2,
+  PRICE_METRIC_COUNT = 3
+};
+
+static unsigned long priceFlashUntilMs[PRICE_METRIC_COUNT] = {0, 0, 0};
+static uint16_t priceFlashBg[PRICE_METRIC_COUNT] = {0, 0, 0};
+
+// Widget enable flags (permitem parar renderização independente)
+static bool widgetUsdEnabled = true;
+static bool widgetBrlEnabled = true;
+static bool widgetBtcEnabled = true;
+static bool widgetEthEnabled = true;
+
+void displayEnableWidgetUsd(bool enabled) { widgetUsdEnabled = enabled; }
+void displayEnableWidgetBrl(bool enabled) { widgetBrlEnabled = enabled; }
+void displayEnableWidgetBtc(bool enabled) { widgetBtcEnabled = enabled; }
+void displayEnableWidgetEth(bool enabled) { widgetEthEnabled = enabled; }
 
 static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
   return ((uint16_t)(r & 0xF8) << 8) | ((uint16_t)(g & 0xFC) << 3) | (b >> 3);
@@ -83,6 +134,24 @@ static void initPalette() {
   colorOk     = rgb(86, 212, 126);
   colorDown   = rgb(255, 82, 82);
   colorWarn   = rgb(255, 167, 63);
+  colorFlashUpBg = rgb(19, 45, 31);
+  colorFlashDownBg = rgb(45, 20, 24);
+}
+
+static uint16_t blend565(uint16_t base, uint16_t accent, uint8_t accentWeight) {
+  const uint8_t baseWeight = 255 - accentWeight;
+  const uint8_t baseR = (base >> 11) & 0x1F;
+  const uint8_t baseG = (base >> 5) & 0x3F;
+  const uint8_t baseB = base & 0x1F;
+  const uint8_t accentR = (accent >> 11) & 0x1F;
+  const uint8_t accentG = (accent >> 5) & 0x3F;
+  const uint8_t accentB = accent & 0x1F;
+
+  const uint8_t outR = (uint8_t)((baseR * baseWeight + accentR * accentWeight) / 255);
+  const uint8_t outG = (uint8_t)((baseG * baseWeight + accentG * accentWeight) / 255);
+  const uint8_t outB = (uint8_t)((baseB * baseWeight + accentB * accentWeight) / 255);
+
+  return (uint16_t)((outR << 11) | (outG << 5) | outB);
 }
 
 static void fillText(char* out, size_t outSize, const char* text) {
@@ -138,6 +207,7 @@ static void drawCenteredStatusText(int x, int y, int w, const char* text) {
 }
 
 static void drawHeader() {
+  // placeholder: old signature kept for static shell; real header uses data-aware version
   tft->fillRect(0, 0, SCREEN_W, 26, colorPanel2);
   tft->drawFastHLine(0, 25, SCREEN_W, colorLine);
   tft->setTextSize(1);
@@ -145,14 +215,30 @@ static void drawHeader() {
   tft->setCursor(8, 8);
   tft->print("Cadiz - Crypto Exchange Dashboard");
 
-  const uint16_t netColor = currentData.wifiConnected ? colorOk : colorWarn;
+  const uint16_t netColor = colorWarn;
+  tft->fillCircle(SCREEN_W - 12, 13, 5, netColor);
+  tft->drawCircle(SCREEN_W - 12, 13, 5, colorText);
+}
+
+static void drawHeaderStatic() {
+  tft->fillRect(0, 0, SCREEN_W, 26, colorPanel2);
+  tft->drawFastHLine(0, 25, SCREEN_W, colorLine);
+  tft->setTextSize(1);
+  tft->setTextColor(colorAccent);
+  tft->setCursor(8, 8);
+  tft->print("Cadiz - Crypto Exchange Dashboard");
+}
+
+static void updateHeaderStatus(const CryptoMarketData& data) {
+  const uint16_t netColor = data.wifiConnected ? colorOk : colorWarn;
+  tft->fillCircle(SCREEN_W - 12, 13, 5, colorPanel2);
   tft->fillCircle(SCREEN_W - 12, 13, 5, netColor);
   tft->drawCircle(SCREEN_W - 12, 13, 5, colorText);
 }
 
 static void drawStaticShell() {
   tft->fillScreen(colorBg);
-  drawHeader();
+  drawHeaderStatic();
 
   drawFrame(6, 32, CARD_W, CARD_H, "DOLAR");
   drawFrame(122, 32, CARD_W, CARD_H, "REAL");
@@ -163,15 +249,6 @@ static void drawStaticShell() {
   drawFrame(6, 162, 228, 74, "Tendencia ETH x BRL");
   drawFrame(6, 240, 228, 74, "Tendencia BTC x BRL");
 
-  tft->setTextSize(1);
-  tft->setTextColor(colorMuted);
-  tft->setCursor(12, 145);
-  tft->print("WiFi");
-  tft->setCursor(88, 145);
-  tft->print("WebSocket");
-  tft->setCursor(170, 145);
-  tft->print("Updates");
-
   tft->drawFastHLine(10, 199, 220, rgb(46, 73, 102));
   tft->drawFastHLine(10, 277, 220, rgb(46, 73, 102));
 
@@ -181,8 +258,8 @@ static void drawStaticShell() {
   btcGraphPrevY = -1;
 }
 
-static void drawMetricValue(int x, int y, int w, const char* value, const char* unit, uint16_t color, char* prevText, uint16_t* prevColor) {
-  if (strcmp(prevText, value) == 0 && prevColor && *prevColor == color) {
+static void drawMetricValue(int x, int y, int w, const char* value, const char* unit, uint16_t color, uint16_t bgColor, char* prevText, uint16_t* prevColor, bool forceRedraw) {
+  if (!forceRedraw && strcmp(prevText, value) == 0 && prevColor && *prevColor == color) {
     return;
   }
 
@@ -192,23 +269,106 @@ static void drawMetricValue(int x, int y, int w, const char* value, const char* 
   }
 
   // Limpa apenas a faixa do valor, preservando o titulo do card.
-  tft->fillRect(x + 1, y + 14, w - 2, 28, colorPanel);
+  tft->fillRect(x + 1, y + 14, w - 2, 28, bgColor);
 
   tft->setTextSize(2);
-  tft->setTextColor(color, colorPanel);
+  tft->setTextColor(color, bgColor);
   tft->setCursor(x + 4, y + 18);
   tft->print(value);
 
   tft->setTextSize(1);
-  tft->setTextColor(colorText, colorPanel);
+  tft->setTextColor(colorText, bgColor);
   const int unitX = x + w - (int)strlen(unit) * 6 - 6;
   tft->setCursor(unitX, y + 31);
   tft->print(unit);
 }
 
-static void drawStatusCard() {
-  // Card central propositalmente vazio por enquanto.
-  tft->fillRect(10, 144, 220, 8, colorPanel);
+static void paintPriceMetric(int metricIndex,
+                             int x,
+                             int y,
+                             int w,
+                             const char* value,
+                             const char* unit,
+                             uint16_t textColor,
+                             uint16_t bgColor,
+                             char* prevText,
+                             uint16_t* prevColor,
+                             bool forceRedraw) {
+  drawMetricValue(x, y, w, value, unit, textColor, bgColor, prevText, prevColor, forceRedraw);
+}
+
+static void startPriceFlash(int metricIndex, bool isUp, unsigned long nowMs) {
+  if (metricIndex < 0 || metricIndex >= PRICE_METRIC_COUNT) {
+    return;
+  }
+
+  priceFlashUntilMs[metricIndex] = nowMs + PRICE_FLASH_MS;
+  priceFlashBg[metricIndex] = isUp ? colorFlashUpBg : colorFlashDownBg;
+}
+
+static void refreshExpiredPriceFlashes(const CryptoMarketData& data, unsigned long nowMs) {
+  const struct {
+    int metricIndex;
+    int x;
+    int y;
+    int w;
+    const char* value;
+    const char* unit;
+    uint16_t textColor;
+    char* prevText;
+    uint16_t* prevColor;
+    bool hasValue;
+  } metrics[] = {
+    {PRICE_METRIC_BRL, 122, 32, CARD_W, nullptr, "BRL", 0, prevBrlText, &prevBrlColor, data.hasUsdtBrl},
+    {PRICE_METRIC_BTC, 6, 84, CARD_W, nullptr, "USD", 0, prevBtcText, &prevBtcColor, data.hasBtcUsdt},
+    {PRICE_METRIC_ETH, 122, 84, CARD_W, nullptr, "USD", 0, prevEthText, &prevEthColor, data.hasEthUsdt},
+  };
+
+  char brlText[20];
+  char btcText[20];
+  char ethText[20];
+  formatFixed4(data.usdtBrl, brlText, sizeof(brlText));
+  formatCompact(data.btcUsdt, btcText, sizeof(btcText));
+  formatCompact3(data.ethUsdt, ethText, sizeof(ethText));
+
+  for (const auto& metric : metrics) {
+    if (priceFlashUntilMs[metric.metricIndex] == 0 || nowMs < priceFlashUntilMs[metric.metricIndex]) {
+      continue;
+    }
+
+    const char* value = nullptr;
+    switch (metric.metricIndex) {
+      case PRICE_METRIC_BRL: value = brlText; break;
+      case PRICE_METRIC_BTC: value = btcText; break;
+      case PRICE_METRIC_ETH: value = ethText; break;
+      default: break;
+    }
+
+    if (!value || !metric.hasValue) {
+      priceFlashUntilMs[metric.metricIndex] = 0;
+      continue;
+    }
+
+    const uint16_t textColor = (metric.metricIndex == PRICE_METRIC_BRL)
+      ? ((lastDrawnData.hasUsdtBrl && data.usdtBrl > lastDrawnData.usdtBrl) ? colorOk : colorDown)
+      : (metric.metricIndex == PRICE_METRIC_BTC)
+        ? ((lastDrawnData.hasBtcUsdt && data.btcUsdt > lastDrawnData.btcUsdt) ? colorOk : colorDown)
+        : ((lastDrawnData.hasEthUsdt && data.ethUsdt > lastDrawnData.ethUsdt) ? colorOk : colorDown);
+
+    paintPriceMetric(metric.metricIndex,
+                     metric.x,
+                     metric.y,
+                     metric.w,
+                     value,
+                     metric.unit,
+                     textColor,
+                     colorPanel,
+                     metric.prevText,
+                     metric.prevColor,
+                     true);
+
+    priceFlashUntilMs[metric.metricIndex] = 0;
+  }
 }
 
 static float clampFloat(float v, float vmin, float vmax) {
@@ -235,9 +395,10 @@ static void pushGraphSample(float ethBrl, float usdBrl) {
   graphsNeedRedraw = true;
 }
 
-static void drawGraphArea(int left, int top, int width, int height, const float* history, uint16_t count, uint16_t head, uint16_t lineColor, uint16_t gridColor) {
-  tft->fillRect(left, top, width, height, colorPanel);
-  tft->drawRect(left, top, width, height, colorLine);
+template <typename BufferType>
+static void drawGraphArea(BufferType& gfx, int width, int height, const float* history, uint16_t count, uint16_t head, uint16_t lineColor, uint16_t gridColor) {
+  gfx.fillRect(0, 0, width, height, colorPanel);
+  gfx.drawRect(0, 0, width, height, colorLine);
 
   if (count == 0) {
     return;
@@ -258,13 +419,13 @@ static void drawGraphArea(int left, int top, int width, int height, const float*
     minValue -= 1.0f;
   }
 
-  const int innerLeft = left + 2;
-  const int innerTop = top + 2;
+  const int innerLeft = 2;
+  const int innerTop = 2;
   const int innerWidth = width - 4;
   const int innerHeight = height - 4;
   const int innerBottom = innerTop + innerHeight - 1;
 
-  tft->drawFastHLine(innerLeft, innerTop + innerHeight / 2, innerWidth, gridColor);
+  gfx.drawFastHLine(innerLeft, innerTop + innerHeight / 2, innerWidth, gridColor);
 
   int prevX = -1;
   int prevY = -1;
@@ -278,9 +439,9 @@ static void drawGraphArea(int left, int top, int width, int height, const float*
     const int y = scaleToY(value, minValue, maxValue, innerTop, innerBottom);
 
     if (prevX >= 0) {
-      tft->drawLine(prevX, prevY, x, y, lineColor);
+      gfx.drawLine(prevX, prevY, x, y, lineColor);
     } else {
-      tft->drawPixel(x, y, lineColor);
+      gfx.drawPixel(x, y, lineColor);
     }
 
     prevX = x;
@@ -288,77 +449,102 @@ static void drawGraphArea(int left, int top, int width, int height, const float*
   }
 }
 
-static void updateRealtimeGraphs() {
-  if (!currentData.hasUsdtBrl || !currentData.hasEthUsdt || !currentData.hasBtcUsdt) {
+static void updateRealtimeGraphs(const CryptoMarketData& data) {
+  if (!data.hasUsdtBrl || !data.hasEthUsdt || !data.hasBtcUsdt) {
     return;
   }
 
   const unsigned long now = millis();
-  const bool newTick = (currentData.messageCount != lastGraphSampleCount);
+  const bool newTick = (data.messageCount != lastGraphSampleCount);
   const bool due = ((now - lastGraphSampleMs) >= 250UL);
 
   if (!newTick && !due && !graphsNeedRedraw) {
     return;
   }
 
-  lastGraphSampleCount = currentData.messageCount;
+  lastGraphSampleCount = data.messageCount;
   lastGraphSampleMs = now;
 
-  pushGraphSample(currentData.ethBrl, currentData.btcBrl);
+  pushGraphSample(data.ethBrl, data.btcBrl);
 
-  drawGraphArea(10, 178, 220, 50, btcGraphHistory, btcGraphCount, btcGraphHead, rgb(255, 214, 64), rgb(46, 73, 102));
-  drawGraphArea(10, 256, 220, 50, usdGraphHistory, usdGraphCount, usdGraphHead, colorBrl, rgb(46, 73, 102));
+  if (btcGraphCanvas) {
+    drawGraphArea(*btcGraphCanvas, 220, 50, btcGraphHistory, btcGraphCount, btcGraphHead, rgb(255, 214, 64), rgb(46, 73, 102));
+    #ifdef USE_TFT_ESPI
+    tft->startWrite();
+    btcGraphCanvas->pushSprite(10, 178);
+    tft->endWrite();
+    #else
+    tft->drawRGBBitmap(10, 178, btcGraphCanvas->getBuffer(), 220, 50);
+    #endif
+  }
+
+  if (usdGraphCanvas) {
+    drawGraphArea(*usdGraphCanvas, 220, 50, usdGraphHistory, usdGraphCount, usdGraphHead, colorBrl, rgb(46, 73, 102));
+    #ifdef USE_TFT_ESPI
+    tft->startWrite();
+    usdGraphCanvas->pushSprite(10, 256);
+    tft->endWrite();
+    #else
+    tft->drawRGBBitmap(10, 256, usdGraphCanvas->getBuffer(), 220, 50);
+    #endif
+  }
 
   graphsNeedRedraw = false;
 }
 
-static void renderIfChanged() {
+static void renderIfChanged(const CryptoMarketData& data) {
   char usdText[20];
   char brlText[20];
   char btcText[20];
   char ethText[20];
 
-  static uint16_t prevUsdColor = 0;
-  static uint16_t prevBrlColor = 0;
-  static uint16_t prevBtcColor = 0;
-  static uint16_t prevEthColor = 0;
-
   fillText(usdText, sizeof(usdText), "1.0000");
-  if (currentData.hasUsdtBrl) {
-    formatFixed4(currentData.usdtBrl, brlText, sizeof(brlText));
+  if (data.hasUsdtBrl) {
+    formatFixed4(data.usdtBrl, brlText, sizeof(brlText));
   } else {
     fillText(brlText, sizeof(brlText), "--");
   }
 
-  if (currentData.hasBtcUsdt) {
-    formatCompact(currentData.btcUsdt, btcText, sizeof(btcText));
+  if (data.hasBtcUsdt) {
+    formatCompact(data.btcUsdt, btcText, sizeof(btcText));
   } else {
     fillText(btcText, sizeof(btcText), "--");
   }
 
-  if (currentData.hasEthUsdt) {
-    formatCompact3(currentData.ethUsdt, ethText, sizeof(ethText));
+  if (data.hasEthUsdt) {
+    formatCompact3(data.ethUsdt, ethText, sizeof(ethText));
   } else {
     fillText(ethText, sizeof(ethText), "--");
   }
 
+  const bool brlChanged = lastDrawnData.hasUsdtBrl && data.hasUsdtBrl && (data.usdtBrl != lastDrawnData.usdtBrl);
+  const bool btcChanged = lastDrawnData.hasBtcUsdt && data.hasBtcUsdt && (data.btcUsdt != lastDrawnData.btcUsdt);
+  const bool ethChanged = lastDrawnData.hasEthUsdt && data.hasEthUsdt && (data.ethUsdt != lastDrawnData.ethUsdt);
+
   const uint16_t usdColor = colorUsd;
-  const uint16_t brlColor = (!lastDrawnData.hasUsdtBrl || currentData.usdtBrl == lastDrawnData.usdtBrl)
+  const uint16_t brlColor = (!lastDrawnData.hasUsdtBrl || data.usdtBrl == lastDrawnData.usdtBrl)
     ? colorBrl
-    : (currentData.usdtBrl > lastDrawnData.usdtBrl ? colorOk : colorDown);
-  const uint16_t btcColor = (!lastDrawnData.hasBtcUsdt || currentData.btcUsdt == lastDrawnData.btcUsdt)
+    : (data.usdtBrl > lastDrawnData.usdtBrl ? colorOk : colorDown);
+  const uint16_t btcColor = (!lastDrawnData.hasBtcUsdt || data.btcUsdt == lastDrawnData.btcUsdt)
     ? colorBrl
-    : (currentData.btcUsdt > lastDrawnData.btcUsdt ? colorOk : colorDown);
-  const uint16_t ethColor = (!lastDrawnData.hasEthUsdt || currentData.ethUsdt == lastDrawnData.ethUsdt)
+    : (data.btcUsdt > lastDrawnData.btcUsdt ? colorOk : colorDown);
+  const uint16_t ethColor = (!lastDrawnData.hasEthUsdt || data.ethUsdt == lastDrawnData.ethUsdt)
     ? colorBrl
-    : (currentData.ethUsdt > lastDrawnData.ethUsdt ? colorOk : colorDown);
+    : (data.ethUsdt > lastDrawnData.ethUsdt ? colorOk : colorDown);
 
-  drawMetricValue(6, 32, CARD_W, usdText, "USD", usdColor, prevUsdText, &prevUsdColor);
-  drawMetricValue(122, 32, CARD_W, brlText, "BRL", brlColor, prevBrlText, &prevBrlColor);
-  drawMetricValue(6, 84, CARD_W, btcText, "USD", btcColor, prevBtcText, &prevBtcColor);
-  drawMetricValue(122, 84, CARD_W, ethText, "USD", ethColor, prevEthText, &prevEthColor);
-
-  drawStatusCard();
+  if (widgetUsdEnabled) paintPriceMetric(-1, 6, 32, CARD_W, usdText, "USD", usdColor, colorPanel, prevUsdText, &prevUsdColor, false);
+  if (widgetBrlEnabled) {
+    if (brlChanged) startPriceFlash(PRICE_METRIC_BRL, data.usdtBrl > lastDrawnData.usdtBrl, millis());
+    paintPriceMetric(PRICE_METRIC_BRL, 122, 32, CARD_W, brlText, "BRL", brlColor, priceFlashUntilMs[PRICE_METRIC_BRL] ? priceFlashBg[PRICE_METRIC_BRL] : colorPanel, prevBrlText, &prevBrlColor, brlChanged);
+  }
+  if (widgetBtcEnabled) {
+    if (btcChanged) startPriceFlash(PRICE_METRIC_BTC, data.btcUsdt > lastDrawnData.btcUsdt, millis());
+    paintPriceMetric(PRICE_METRIC_BTC, 6, 84, CARD_W, btcText, "USD", btcColor, priceFlashUntilMs[PRICE_METRIC_BTC] ? priceFlashBg[PRICE_METRIC_BTC] : colorPanel, prevBtcText, &prevBtcColor, btcChanged);
+  }
+  if (widgetEthEnabled) {
+    if (ethChanged) startPriceFlash(PRICE_METRIC_ETH, data.ethUsdt > lastDrawnData.ethUsdt, millis());
+    paintPriceMetric(PRICE_METRIC_ETH, 122, 84, CARD_W, ethText, "USD", ethColor, priceFlashUntilMs[PRICE_METRIC_ETH] ? priceFlashBg[PRICE_METRIC_ETH] : colorPanel, prevEthText, &prevEthColor, ethChanged);
+  }
 
   tft->fillRect(120, 164, 114, 10, colorPanel);
   tft->fillRect(120, 242, 114, 10, colorPanel);
@@ -367,20 +553,25 @@ static void renderIfChanged() {
 
   char ethGraphText[20];
   char btcGraphText[20];
-  snprintf(ethGraphText, sizeof(ethGraphText), "%.2fK BRL", currentData.ethBrl / 1000.0f);
-  snprintf(btcGraphText, sizeof(btcGraphText), "%.2fK BRL", currentData.btcBrl / 1000.0f);
+  snprintf(ethGraphText, sizeof(ethGraphText), "%.2fK BRL", data.ethBrl / 1000.0f);
+  snprintf(btcGraphText, sizeof(btcGraphText), "%.2fK BRL", data.btcBrl / 1000.0f);
 
   tft->setCursor(124, 166);
   tft->print(ethGraphText);
   tft->setCursor(124, 244);
   tft->print(btcGraphText);
 
-  lastDrawnData = currentData;
+  lastDrawnData = data;
   dashboardReady = true;
 }
 
 void displayInit() {
   initPalette();
+
+  // criar mutex para proteger currentData
+  if (!dataMutex) {
+    dataMutex = xSemaphoreCreateMutex();
+  }
 
   pinMode(PIN_RST, OUTPUT);
   pinMode(PIN_DC, OUTPUT);
@@ -395,11 +586,39 @@ void displayInit() {
   digitalWrite(PIN_RST, HIGH);
   delay(200);
 
+  // Cria e inicializa o objeto de display conforme backend selecionado
+#ifdef USE_TFT_ESPI
+  tft = new TFT_eSPI();
+  tft->init();
+  tft->setRotation(2);
+#else
   tft = new Adafruit_ST7789(PIN_CS, PIN_DC, PIN_MOSI, PIN_SCK, PIN_RST);
   tft->init(SCREEN_W, SCREEN_H, SPI_MODE3);
   tft->setRotation(2);
   tft->sendCommand(0x36, (uint8_t[]){0x40}, 1);
   tft->invertDisplay(false);
+#endif
+
+  if (!btcGraphCanvas) {
+    #ifdef USE_TFT_ESPI
+    btcGraphCanvas = new TFT_eSprite(tft);
+    btcGraphCanvas->setColorDepth(16);
+    btcGraphCanvas->setTextWrap(false);
+    btcGraphCanvas->createSprite(220, 50);
+    #else
+    btcGraphCanvas = new GFXcanvas16(220, 50);
+    #endif
+  }
+  if (!usdGraphCanvas) {
+    #ifdef USE_TFT_ESPI
+    usdGraphCanvas = new TFT_eSprite(tft);
+    usdGraphCanvas->setColorDepth(16);
+    usdGraphCanvas->setTextWrap(false);
+    usdGraphCanvas->createSprite(220, 50);
+    #else
+    usdGraphCanvas = new GFXcanvas16(220, 50);
+    #endif
+  }
 
   memset(&currentData, 0, sizeof(currentData));
   memset(&lastDrawnData, 0, sizeof(lastDrawnData));
@@ -413,41 +632,66 @@ void displayInit() {
   lastGraphSampleMs = 0;
   graphsNeedRedraw = true;
   drawStaticShell();
-  renderIfChanged();
+  tickerInit(tft, 6, 138, 228, 18);
+  tickerSetMarketData(currentData);
+  renderFinancialTicker();
+  updateHeaderStatus(currentData);
+  renderIfChanged(currentData);
 }
 
 void displaySetMarketData(const CryptoMarketData& data) {
-  currentData = data;
+  if (dataMutex) {
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      currentData = data;
+      xSemaphoreGive(dataMutex);
+    }
+  } else {
+    currentData = data;
+  }
 }
-
 void displayTick() {
   if (!tft) {
     return;
   }
+  CryptoMarketData safeData;
+  if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    safeData = currentData;
+    xSemaphoreGive(dataMutex);
+  } else {
+    // fallback copy without mutex (unlikely)
+    safeData = currentData;
+  }
 
-  const bool statusChanged = (currentData.wifiConnected != prevWifi)
-                          || (currentData.wsConnected != prevWs)
-                          || (currentData.dataReady != prevDataReady)
-                          || (strcmp(prevWifiSsid, currentData.wifiSsid) != 0)
-                          || (strcmp(prevWifiIp, currentData.wifiIp) != 0);
+  const bool statusChanged = (safeData.wifiConnected != prevWifi)
+                          || (safeData.wsConnected != prevWs)
+                          || (safeData.dataReady != prevDataReady)
+                          || (strcmp(prevWifiSsid, safeData.wifiSsid) != 0)
+                          || (strcmp(prevWifiIp, safeData.wifiIp) != 0);
 
-  const bool marketChanged = (currentData.messageCount != lastRenderedMessageCount)
+  const bool marketChanged = (safeData.messageCount != lastRenderedMessageCount)
                           || (strcmp(prevUsdText, "1.0000") != 0)
                           || (strcmp(prevBrlText, "") == 0)
                           || (strcmp(prevBtcText, "") == 0)
                           || (strcmp(prevEthText, "") == 0);
 
-  if (statusChanged || marketChanged || !dashboardReady) {
-    prevWifi = currentData.wifiConnected;
-    prevWs = currentData.wsConnected;
-    prevDataReady = currentData.dataReady;
-    snprintf(prevWifiSsid, sizeof(prevWifiSsid), "%s", currentData.wifiSsid);
-    snprintf(prevWifiIp, sizeof(prevWifiIp), "%s", currentData.wifiIp);
-    renderIfChanged();
-    lastRenderedMessageCount = currentData.messageCount;
+  if (statusChanged) {
+    prevWifi = safeData.wifiConnected;
+    prevWs = safeData.wsConnected;
+    prevDataReady = safeData.dataReady;
+    snprintf(prevWifiSsid, sizeof(prevWifiSsid), "%s", safeData.wifiSsid);
+    snprintf(prevWifiIp, sizeof(prevWifiIp), "%s", safeData.wifiIp);
+    updateHeaderStatus(safeData);
   }
 
-  updateRealtimeGraphs();
+  if (marketChanged || !dashboardReady) {
+    renderIfChanged(safeData);
+    lastRenderedMessageCount = safeData.messageCount;
+  }
+
+  updateRealtimeGraphs(safeData);
+  tickerSetMarketData(safeData);
+  renderFinancialTicker();
+  refreshExpiredPriceFlashes(safeData, millis());
 }
 
 void displaySetDuration(unsigned long) {}

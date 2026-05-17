@@ -1,6 +1,6 @@
 # Cadiz Crypto Dashboard
 
-Projeto de painel financeiro para ESP32-S3 com display ST7789 240x320, ticker horizontal, cards de preço, gráficos e status de conectividade.
+Projeto de painel financeiro para ESP32-S3-OTG-USB com display ST7789 240x320, ticker horizontal, cards de preço, gráficos e status de conectividade.
 
 ## Autor
 

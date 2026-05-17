@@ -13,8 +13,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#define WIFI_SSID "spectrum_01"
-#define WIFI_PASS "22602260"
+// Insira abaixo suas credencias de internet WIFI
+#define WIFI_SSID "*******"
+#define WIFI_PASS "*******"
 
 static BinanceMarket market;
 

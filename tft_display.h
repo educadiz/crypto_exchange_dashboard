@@ -3,15 +3,23 @@
 
 #include <Arduino.h>
 #include "market_data.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
-// tft_display.h
-// Interface do subsistema de apresentação (dashboard).
-// Contém funções públicas para inicializar e atualizar a tela com
-// snapshots de `CryptoMarketData`.
+/*
+ * Arquivo: tft_display.h
+ * Autor: Eduardo Cadiz
+ * Foco: interface pública do dashboard financeiro no ST7789.
+ * Data: 2026-05-17
+ * Responsabilidade: expor inicialização, atualização e integração do ticker
+ * com o display, além do mutex de SPI compartilhado pelas tasks.
+ */
 
+extern SemaphoreHandle_t gSpiMutex;
 
 void displayInit();
-void displayTick();
+void displayTick();           // Cards, graficos, header — chamado por displayTask
+void displayTickerOnly();     // Apenas o ticker — chamado por tickerTask
 
 void displaySetMarketData(const CryptoMarketData& data);
 

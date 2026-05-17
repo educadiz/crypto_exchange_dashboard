@@ -1,7 +1,13 @@
+/*
+ * Arquivo: tft_display.cpp
+ * Autor: Eduardo Cadiz
+ * Foco: layout e atualização do dashboard financeiro no display ST7789.
+ * Data: 2026-05-17
+ * Responsabilidade: renderizar cards, gráficos, status e integrar o ticker
+ * ao display, sem alterar a lógica de negócio dos dados.
+ */
+
 #include "tft_display.h"
-// tft_display.cpp
-// Renderiza a UI principal: cards de preços, gráficos e ticker.
-// Mantém buffers de desenho off-screen e atualiza apenas regiões mudadas.
 #include "ticker_manager.h"
 #include <SPI.h>
 #include <math.h>
@@ -42,7 +48,8 @@ static GFXcanvas16* btcGraphCanvas = nullptr;
 static GFXcanvas16* usdGraphCanvas = nullptr;
 #endif
 
-// Mutex protecting access to currentData
+SemaphoreHandle_t gSpiMutex = NULL;
+
 static SemaphoreHandle_t dataMutex = NULL;
 
 static char prevUsdText[20] = "";
@@ -120,7 +127,6 @@ void displayEnableWidgetBrl(bool enabled) { widgetBrlEnabled = enabled; }
 void displayEnableWidgetBtc(bool enabled) { widgetBtcEnabled = enabled; }
 void displayEnableWidgetEth(bool enabled) { widgetEthEnabled = enabled; }
 
-// Centraliza utilitários de cor (rgb565 / blend565)
 #include "display_utils.h"
 
 static void initPalette() {
@@ -180,12 +186,10 @@ static void formatCompact3(float value, char* out, size_t outSize) {
   }
 }
 
-// accentColor = 0 -> sem barra de accent; != 0 -> pinta 2px no topo interno do frame
 static void drawFrame(int x, int y, int w, int h, const char* title, uint16_t accentColor = 0) {
   tft->fillRect(x, y, w, h, colorPanel);
   tft->drawRect(x, y, w, h, colorLine);
   if (accentColor != 0) {
-    // Barra accent de 2px no topo interno (sobreposta a borda)
     tft->drawFastHLine(x + 1, y + 1, w - 2, accentColor);
     tft->drawFastHLine(x + 1, y + 2, w - 2, blend565(accentColor, colorPanel, 140));
   }
@@ -197,9 +201,6 @@ static void drawFrame(int x, int y, int w, int h, const char* title, uint16_t ac
   }
 }
 
-// drawCenteredStatusText
-// Desenha uma pequena faixa de texto centralizada dentro de uma largura `w`.
-// Usado para textos de status no cabeçalho.
 static void drawCenteredStatusText(int x, int y, int w, const char* text) {
   const int textW = (int)strlen(text) * 6;
   int textX = x + (w - textW) / 2;
@@ -212,30 +213,21 @@ static void drawCenteredStatusText(int x, int y, int w, const char* text) {
   tft->print(text);
 }
 
-// drawHeaderStatic
-// Desenha elementos estáticos do cabeçalho (barra superior, título e linha)
 static void drawHeaderStatic() {
   tft->fillRect(0, 0, SCREEN_W, 26, colorPanel2);
-  // Linha inferior do header
   tft->drawFastHLine(0, 25, SCREEN_W, colorLine);
-  // Linha accent fina no topo absoluto (1 px)
   tft->drawFastHLine(0, 0, SCREEN_W, colorBrl);
   tft->setTextSize(1);
   tft->setTextColor(colorAccent, colorPanel2);
   tft->setCursor(8, 9);
-  tft->print("Cadiz  Crypto  Exchange");
+  tft->print("Dashboard: Crypto Exchange");
 }
 
-// updateHeaderStatus
-// Atualiza o indicador de conectividade (dot) no canto superior direito.
-// Desenha anel externo, ponto central e ícones auxiliares conforme estado.
 static void updateHeaderStatus(const CryptoMarketData& data) {
   const int cx = SCREEN_W - 13;
   const int cy = 13;
-  // Limpa area ao redor do dot
   tft->fillRect(cx - 9, cy - 9, 18, 18, colorPanel2);
   if (data.wifiConnected && data.wsConnected) {
-    // Anel externo sutil (conexao plena)
     tft->drawCircle(cx, cy, 7, colorDotRing);
   }
   const uint16_t dotColor = data.wifiConnected
@@ -243,35 +235,27 @@ static void updateHeaderStatus(const CryptoMarketData& data) {
     : colorDown;
   tft->fillCircle(cx, cy, 5, dotColor);
   tft->drawCircle(cx, cy, 5, colorText);
-  // Ponto WS menor no centro quando ambos ativos
   if (data.wifiConnected && data.wsConnected && data.dataReady) {
     tft->fillCircle(cx, cy, 2, colorPanel2);
   }
 }
 
-// drawStaticShell
-// Desenha a estrutura fixa da UI: painéis, frames e linhas de grade.
-// Executado uma vez na inicialização e quando for necessário redesenhar tudo.
 static void drawStaticShell() {
   tft->fillScreen(colorBg);
   drawHeaderStatic();
 
-  // Cards de preço com accent bar por ativo
   drawFrame(6,   32, CARD_W, CARD_H, "DOLAR",    colorUsd);
   drawFrame(122, 32, CARD_W, CARD_H, "REAL",     colorBrl);
   drawFrame(6,   84, CARD_W, CARD_H, "BITCOIN",  colorBtc);
   drawFrame(122, 84, CARD_W, CARD_H, "ETHEREUM", colorEth);
 
-  // Frame ticker e gráficos
   drawFrame(6, 138, 228, 18, "");
   drawFrame(6, 162, 228, 74, "Tendencia ETH x BRL");
   drawFrame(6, 240, 228, 74, "Tendencia BTC x BRL");
 
-  // Linhas de grade central dos gráficos
   tft->drawFastHLine(8, 199, 224, blend565(colorLine, colorPanel, 180));
   tft->drawFastHLine(8, 277, 224, blend565(colorLine, colorPanel, 180));
 
-  // Status bar inferior: fundo + linha de separação
   tft->fillRect(0, 306, SCREEN_W, 14, colorStatusBg);
   tft->drawFastHLine(0, 306, SCREEN_W, colorLine);
   tft->setTextSize(1);
@@ -285,9 +269,6 @@ static void drawStaticShell() {
   btcGraphPrevY = -1;
 }
 
-// drawMetricValue
-// Desenha o valor principal de um card (valor + unidade) e evita redraw
-// se o texto e a cor não mudaram, para reduzir escrita na tela.
 static void drawMetricValue(int x, int y, int w, const char* value, const char* unit, uint16_t color, uint16_t bgColor, char* prevText, uint16_t* prevColor, bool forceRedraw) {
   if (!forceRedraw && strcmp(prevText, value) == 0 && prevColor && *prevColor == color) {
     return;
@@ -298,30 +279,23 @@ static void drawMetricValue(int x, int y, int w, const char* value, const char* 
     *prevColor = color;
   }
 
-  // Limpa apenas a faixa do valor, preservando titulo e accent bar do card
   tft->fillRect(x + 1, y + 14, w - 2, 32, bgColor);
 
-  // Valor principal (size 2 = 12x16 px por char)
   tft->setTextSize(2);
   tft->setTextColor(color, bgColor);
   tft->setCursor(x + 4, y + 18);
   tft->print(value);
 
-  // Unit label alinhado à direita, muted
   tft->setTextSize(1);
   tft->setTextColor(colorMuted, bgColor);
   const int unitW = (int)strlen(unit) * 6;
   tft->setCursor(x + w - unitW - 5, y + 38);
   tft->print(unit);
 
-  // Mini seta direcional no canto inferior esquerdo do card
-  // Decodifica direção pela cor: colorOk = sobe, colorDown = desce, outro = neutro
   if (color == colorOk) {
-    // Triangulo para cima (4x4 px)
     const int ax = x + 5, ay = y + 40;
     tft->fillTriangle(ax + 3, ay - 4, ax, ay, ax + 6, ay, colorOk);
   } else if (color == colorDown) {
-    // Triangulo para baixo
     const int ax = x + 5, ay = y + 36;
     tft->fillTriangle(ax + 3, ay + 4, ax, ay, ax + 6, ay, colorDown);
   }
@@ -612,8 +586,6 @@ static void renderIfChanged(const CryptoMarketData& data) {
     paintPriceMetric(PRICE_METRIC_ETH, 122, 84, CARD_W, ethText, "USD", ethColor, priceFlashUntilMs[PRICE_METRIC_ETH] ? priceFlashBg[PRICE_METRIC_ETH] : colorPanel, prevEthText, &prevEthColor, ethChanged);
   }
 
-  // --- Labels do valor atual nos gráficos (linha do título) ---
-  // ETH BRL (frame y=162, título em y=167, label em y=162)
   {
     char ethGraphText[20];
     snprintf(ethGraphText, sizeof(ethGraphText), "%.2fK BRL", data.ethBrl / 1000.0f);
@@ -624,7 +596,6 @@ static void renderIfChanged(const CryptoMarketData& data) {
     tft->setCursor(230 - labelW, 165);
     tft->print(ethGraphText);
   }
-  // BTC BRL (frame y=240, título em y=245, label em y=242)
   {
     char btcGraphText[20];
     snprintf(btcGraphText, sizeof(btcGraphText), "%.2fK BRL", data.btcBrl / 1000.0f);
@@ -636,12 +607,10 @@ static void renderIfChanged(const CryptoMarketData& data) {
     tft->print(btcGraphText);
   }
 
-  // --- Status bar inferior: IP e contador de mensagens ---
   {
     tft->fillRect(0, 306, SCREEN_W, 14, colorStatusBg);
     tft->drawFastHLine(0, 306, SCREEN_W, colorLine);
     tft->setTextSize(1);
-    // IP à esquerda
     char ipStr[28];
     if (data.wifiConnected && data.wifiIp[0] != '\0') {
       snprintf(ipStr, sizeof(ipStr), "IP: %s", data.wifiIp);
@@ -651,7 +620,6 @@ static void renderIfChanged(const CryptoMarketData& data) {
     tft->setTextColor(colorMuted, colorStatusBg);
     tft->setCursor(6, 309);
     tft->print(ipStr);
-    // Contador à direita
     char msgStr[16];
     snprintf(msgStr, sizeof(msgStr), "#%lu", (unsigned long)data.messageCount);
     const int msgW = (int)strlen(msgStr) * 6;
@@ -668,9 +636,11 @@ static void renderIfChanged(const CryptoMarketData& data) {
 void displayInit() {
   initPalette();
 
-  // criar mutex para proteger currentData
   if (!dataMutex) {
     dataMutex = xSemaphoreCreateMutex();
+  }
+  if (!gSpiMutex) {
+    gSpiMutex = xSemaphoreCreateMutex();
   }
 
   pinMode(PIN_RST, OUTPUT);
@@ -686,12 +656,13 @@ void displayInit() {
   digitalWrite(PIN_RST, HIGH);
   delay(200);
 
-  // Cria e inicializa o objeto de display conforme backend selecionado
 #ifdef USE_TFT_ESPI
   tft = new TFT_eSPI();
   tft->init();
   tft->setRotation(2);
 #else
+  SPI.begin(PIN_SCK, -1, PIN_MOSI, PIN_CS);
+  SPI.setFrequency(80000000UL);
   tft = new Adafruit_ST7789(PIN_CS, PIN_DC, PIN_MOSI, PIN_SCK, PIN_RST);
   tft->init(SCREEN_W, SCREEN_H, SPI_MODE3);
   tft->setRotation(2);
@@ -758,7 +729,6 @@ void displayTick() {
     safeData = currentData;
     xSemaphoreGive(dataMutex);
   } else {
-    // fallback copy without mutex (unlikely)
     safeData = currentData;
   }
 
@@ -773,6 +743,24 @@ void displayTick() {
                           || (strcmp(prevBrlText, "") == 0)
                           || (strcmp(prevBtcText, "") == 0)
                           || (strcmp(prevEthText, "") == 0);
+
+  static unsigned long lastDisplayTraceMs = 0;
+  if ((millis() - lastDisplayTraceMs) >= 5000UL) {
+    Serial.printf("[DISPLAY] wifi=%d ws=%d ready=%d msg=%lu status=%d market=%d graphs=%d ticker=%d\n",
+                  safeData.wifiConnected,
+                  safeData.wsConnected,
+                  safeData.dataReady,
+                  (unsigned long)safeData.messageCount,
+                  statusChanged,
+                  marketChanged,
+                  graphsNeedRedraw,
+                  dashboardReady);
+    lastDisplayTraceMs = millis();
+  }
+
+  if (gSpiMutex && xSemaphoreTake(gSpiMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+    return;
+  }
 
   if (statusChanged) {
     prevWifi = safeData.wifiConnected;
@@ -790,10 +778,33 @@ void displayTick() {
 
   updateRealtimeGraphs(safeData);
   tickerSetMarketData(safeData);
-  renderFinancialTicker();
   refreshExpiredPriceFlashes(safeData, millis());
+
+  if (gSpiMutex) xSemaphoreGive(gSpiMutex);
 }
 
 void displaySetDuration(unsigned long) {}
 void displayUseSimulation(bool) {}
 void displaySetMeasurements(float, float, float, float) {}
+
+void displayTickerOnly() {
+  if (!tft) return;
+
+  CryptoMarketData safeData;
+  if (dataMutex && xSemaphoreTake(dataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+    safeData = currentData;
+    xSemaphoreGive(dataMutex);
+  } else {
+    safeData = currentData;
+  }
+
+  tickerSetMarketData(safeData);
+
+  if (gSpiMutex && xSemaphoreTake(gSpiMutex, 0) != pdTRUE) {
+    return;
+  }
+
+  renderFinancialTicker();
+
+  if (gSpiMutex) xSemaphoreGive(gSpiMutex);
+}

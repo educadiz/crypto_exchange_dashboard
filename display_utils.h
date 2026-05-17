@@ -1,6 +1,11 @@
-// display_utils.h
-// Pequenos utilitários para conversão de cores e blend em RGB565/BGR565.
-// Centraliza lógica para evitar inconsistências entre arquivos.
+/*
+ * Arquivo: display_utils.h
+ * Autor: Eduardo Cadiz
+ * Foco: utilitários de cor e mistura em RGB565/BGR565.
+ * Data: 2026-05-17
+ * Responsabilidade: centralizar conversão e blend de cores para manter o
+ * desenho consistente entre ticker, gráficos e cards.
+ */
 #ifndef DISPLAY_UTILS_H
 #define DISPLAY_UTILS_H
 

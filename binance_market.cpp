@@ -1,26 +1,32 @@
-// binance_market.cpp
-// Conecta ao Binance WebSocket, mantém um snapshot em memória e fornece
-// acesso de leitura a partir de outras threads/tasks.
+/*
+ * Arquivo: binance_market.cpp
+ * Autor: Eduardo Cadiz
+ * Foco: Conexão WiFi/WebSocket da Binance e cálculo do snapshot de mercado.
+ * Data: 2026-05-17
+ * Responsabilidade: manter a conexão, atualizar o estado do mercado e expor
+ * um snapshot estável para o subsistema de display.
+ */
 
 #include "binance_market.h"
 #include <ArduinoJson.h>
 #include <WiFi.h>
 #include <cstring>
 
-// ======================= CONFIG =========================
 static const char* BINANCE_HOST = "stream.binance.com";
 static const uint16_t BINANCE_PORT = 9443;
 
-// ✔ STREAMS CORRETOS (ETH FIXADO)
 static const char* BINANCE_PATH =
 "/stream?streams="
 "btcusdt@miniTicker/"
 "usdtbrl@miniTicker/"
 "ethusdt@miniTicker";
 
+static bool lastWifiConnectedLogged = false;
+static bool lastWsConnectedLogged = false;
+static unsigned long lastHeartbeatMs = 0;
+
 BinanceMarket* BinanceMarket::instance = nullptr;
 
-// ======================= CONSTRUTOR ======================
 BinanceMarket::BinanceMarket()
   : wsStarted(false),
     lastWifiAttemptMs(0),
@@ -33,7 +39,6 @@ BinanceMarket::BinanceMarket()
   std::memset(wifiPassword, 0, sizeof(wifiPassword));
 }
 
-// ======================= INIT WIFI ======================
 void BinanceMarket::begin(const char* ssid, const char* password) {
   std::snprintf(wifiSsid, sizeof(wifiSsid), "%s", ssid ? ssid : "");
   std::snprintf(wifiPassword, sizeof(wifiPassword), "%s", password ? password : "");
@@ -49,20 +54,30 @@ void BinanceMarket::begin(const char* ssid, const char* password) {
   connectWiFi();
 }
 
-// ======================= LOOP ============================
 void BinanceMarket::loop() {
   const unsigned long now = millis();
 
   snapshot.wifiConnected = (WiFi.status() == WL_CONNECTED);
 
-  // Atualiza IP quando WiFi está conectado (preenche snapshot.wifiIp)
   if (snapshot.wifiConnected) {
     IPAddress ip = WiFi.localIP();
     std::snprintf(snapshot.wifiIp, sizeof(snapshot.wifiIp), "%d.%d.%d.%d",
                   ip[0], ip[1], ip[2], ip[3]);
+    if (!lastWifiConnectedLogged) {
+      Serial.printf("[WIFI] connected IP=%s\n", snapshot.wifiIp);
+      lastWifiConnectedLogged = true;
+    }
   } else {
+    if (lastWifiConnectedLogged) {
+      Serial.println("[WIFI] disconnected");
+      lastWifiConnectedLogged = false;
+    }
     snapshot.wifiIp[0] = '\0';
     snapshot.wsConnected = false;
+    if (lastWsConnectedLogged) {
+      Serial.println("[WS] disconnected (wifi lost)");
+      lastWsConnectedLogged = false;
+    }
 
     if (wsStarted) {
       webSocket.disconnect();
@@ -81,26 +96,33 @@ void BinanceMarket::loop() {
     }
   }
 
+  if (snapshot.wifiConnected && (now - lastHeartbeatMs) >= 10000UL) {
+    Serial.printf("[NET] wifi=%d ws=%d ready=%d msg=%lu ip=%s\n",
+                  snapshot.wifiConnected,
+                  snapshot.wsConnected,
+                  snapshot.dataReady,
+                  (unsigned long)snapshot.messageCount,
+                  snapshot.wifiIp);
+    lastHeartbeatMs = now;
+  }
+
   // 🔴 obrigatório
   webSocket.loop();
 }
 
-// ======================= WIFI RECONNECT ==================
 void BinanceMarket::connectWiFi() {
   lastWifiAttemptMs = millis();
+  Serial.println("[WIFI] reconnecting...");
   WiFi.disconnect(false, false);
   WiFi.begin(wifiSsid, wifiPassword);
 }
 
-// connectWebSocket
-// Cria e configura a conexão WebSocket segura para o stream de mercado.
-
-// ======================= WS CONNECT ======================
 void BinanceMarket::connectWebSocket() {
   lastWsAttemptMs = millis();
   wsStarted = false;
 
   snapshot.reconnectCount++;
+  Serial.printf("[WS] connecting retry=%lu\n", (unsigned long)snapshot.reconnectCount);
 
   webSocket.onEvent(BinanceMarket::handleWebSocketEventStatic);
   webSocket.setReconnectInterval(3000);
@@ -112,14 +134,12 @@ void BinanceMarket::connectWebSocket() {
   );
 }
 
-// ======================= CALLBACK STATIC =================
 void BinanceMarket::handleWebSocketEventStatic(WStype_t type, uint8_t* payload, size_t length) {
   if (instance) {
     instance->handleWebSocketEvent(type, payload, length);
   }
 }
 
-// ======================= CALLBACK ========================
 void BinanceMarket::handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 
   switch (type) {
@@ -129,6 +149,7 @@ void BinanceMarket::handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t
       snapshot.wsConnected = true;
       snapshot.lastUpdateMs = millis();
       Serial.println("[WS] CONNECTED");
+      lastWsConnectedLogged = true;
       break;
 
     case WStype_DISCONNECTED:
@@ -136,6 +157,7 @@ void BinanceMarket::handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t
       snapshot.wsConnected = false;
       Serial.println("[WS] DISCONNECTED");
       lastWsAttemptMs = millis();
+      lastWsConnectedLogged = false;
       break;
 
     case WStype_ERROR:
@@ -143,6 +165,7 @@ void BinanceMarket::handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t
       snapshot.wsConnected = false;
       Serial.println("[WS] ERROR");
       lastWsAttemptMs = millis();
+      lastWsConnectedLogged = false;
       break;
 
     case WStype_TEXT: {
@@ -163,19 +186,16 @@ void BinanceMarket::handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t
 
       float price = strtof(priceText, nullptr);
 
-      // ================= BTC =================
       if (strstr(streamName, "btcusdt")) {
         snapshot.btcUsdt = price;
         snapshot.hasBtcUsdt = true;
       }
 
-      // ================= BRL =================
       else if (strstr(streamName, "usdtbrl")) {
         snapshot.usdtBrl = price;
         snapshot.hasUsdtBrl = true;
       }
 
-      // ================= ETH =================
       else if (strstr(streamName, "ethusdt")) {
         snapshot.ethUsdt = price;
         snapshot.hasEthUsdt = true;
@@ -194,7 +214,6 @@ void BinanceMarket::handleWebSocketEvent(WStype_t type, uint8_t* payload, size_t
   }
 }
 
-// ======================= DERIVED =========================
 void BinanceMarket::updateDerivedValues() {
 
   if (snapshot.hasBtcUsdt && snapshot.hasUsdtBrl) {
@@ -205,14 +224,11 @@ void BinanceMarket::updateDerivedValues() {
     snapshot.ethBrl = snapshot.ethUsdt * snapshot.usdtBrl;
   }
 
-  // ✔ não depende de dados inexistentes
   snapshot.dataReady =
     snapshot.hasBtcUsdt &&
     snapshot.hasUsdtBrl;
-  // eth is optional; but if present, it's marked by hasEthUsdt
 }
 
-// ======================= GET =============================
 const CryptoMarketData& BinanceMarket::data() const {
   return snapshot;
 }

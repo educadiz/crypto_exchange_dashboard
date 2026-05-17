@@ -1,9 +1,14 @@
 #ifndef MARKET_DATA_H
 #define MARKET_DATA_H
 
-// market_data.h
-// Estruturas simples que carregam snapshots do estado do mercado e do
-// estado do sistema (WiFi/WS). Usado pelo subsistema de display.
+/*
+ * Arquivo: market_data.h
+ * Autor: Eduardo Cadiz
+ * Foco: estruturas de dados do snapshot de mercado e conectividade.
+ * Data: 2026-05-17
+ * Responsabilidade: definir o formato estável de dados compartilhado entre
+ * market, display e ticker.
+ */
 
 #include <Arduino.h>
 

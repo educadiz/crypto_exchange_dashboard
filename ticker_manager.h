@@ -1,9 +1,14 @@
 #ifndef TICKER_MANAGER_H
 #define TICKER_MANAGER_H
 
-// ticker_manager.h
-// Interface do ticker financeiro: constrói itens a partir de `CryptoMarketData`
-// e expõe funções para inicialização e renderização.
+/*
+ * Arquivo: ticker_manager.h
+ * Autor: Eduardo Cadiz
+ * Foco: interface do ticker financeiro horizontal.
+ * Data: 2026-05-17
+ * Responsabilidade: declarar estruturas e funções para inicializar, alimentar
+ * e renderizar a faixa de tickers sem interferir na lógica de mercado.
+ */
 
 #include <Arduino.h>
 #include "market_data.h"
